@@ -26,6 +26,10 @@ type PersistedEditorControls = Pick<
 	| "cursorSway"
 	| "borderRadius"
 	| "padding"
+	| "sceneFrameStyle"
+	| "sceneFrameText"
+	| "sceneFrameOpacity"
+	| "sceneFrameThickness"
 	| "webcam"
 	| "aspectRatio"
 	| "exportQuality"
@@ -74,6 +78,10 @@ export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
 	cursorSway: DEFAULT_EDITOR_CONTROLS.cursorSway,
 	borderRadius: DEFAULT_EDITOR_CONTROLS.borderRadius,
 	padding: DEFAULT_EDITOR_CONTROLS.padding,
+	sceneFrameStyle: DEFAULT_EDITOR_CONTROLS.sceneFrameStyle,
+	sceneFrameText: DEFAULT_EDITOR_CONTROLS.sceneFrameText,
+	sceneFrameOpacity: DEFAULT_EDITOR_CONTROLS.sceneFrameOpacity,
+	sceneFrameThickness: DEFAULT_EDITOR_CONTROLS.sceneFrameThickness,
 	webcam: DEFAULT_EDITOR_CONTROLS.webcam,
 	aspectRatio: DEFAULT_EDITOR_CONTROLS.aspectRatio,
 	exportQuality: DEFAULT_EDITOR_CONTROLS.exportQuality,
@@ -152,6 +160,10 @@ function normalizeEditorControls(
 		cursorSway: raw.cursorSway ?? fallback.cursorSway,
 		borderRadius: raw.borderRadius ?? fallback.borderRadius,
 		padding: raw.padding ?? fallback.padding,
+		sceneFrameStyle: raw.sceneFrameStyle ?? fallback.sceneFrameStyle,
+		sceneFrameText: raw.sceneFrameText ?? fallback.sceneFrameText,
+		sceneFrameOpacity: raw.sceneFrameOpacity ?? fallback.sceneFrameOpacity,
+		sceneFrameThickness: raw.sceneFrameThickness ?? fallback.sceneFrameThickness,
 		webcam: raw.webcam ?? fallback.webcam,
 		aspectRatio: raw.aspectRatio ?? fallback.aspectRatio,
 		exportQuality: raw.exportQuality ?? fallback.exportQuality,
@@ -188,6 +200,10 @@ function normalizeEditorControls(
 		cursorSway: normalized.cursorSway,
 		borderRadius: normalized.borderRadius,
 		padding: normalized.padding,
+		sceneFrameStyle: normalized.sceneFrameStyle,
+		sceneFrameText: normalized.sceneFrameText,
+		sceneFrameOpacity: normalized.sceneFrameOpacity,
+		sceneFrameThickness: normalized.sceneFrameThickness,
 		webcam: normalized.webcam,
 		aspectRatio: normalized.aspectRatio,
 		exportQuality: normalized.exportQuality,

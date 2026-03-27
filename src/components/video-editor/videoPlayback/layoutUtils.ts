@@ -1,5 +1,6 @@
 import { Application, Sprite, Graphics } from 'pixi.js';
-import type { CropRegion } from '../types';
+import { computeSceneFrameLayout, type SceneFrameLayout } from '@/lib/sceneFrames';
+import type { CropRegion, SceneFrameStyle } from '../types';
 import { drawSquircleOnGraphics } from '@/lib/geometry/squircle';
 
 interface LayoutParams {
@@ -12,6 +13,8 @@ interface LayoutParams {
   lockedVideoDimensions?: { width: number; height: number } | null;
   borderRadius?: number;
   padding?: number;
+  sceneFrameStyle?: SceneFrameStyle;
+  sceneFrameThickness?: number;
 }
 
 interface LayoutResult {
@@ -27,10 +30,23 @@ interface LayoutResult {
     sourceCrop?: CropRegion;
   };
   cropBounds: { startX: number; endX: number; startY: number; endY: number };
+  sceneFrameLayout: SceneFrameLayout;
 }
 
 export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
-  const { container, app, videoSprite, maskGraphics, videoElement, cropRegion, lockedVideoDimensions, borderRadius = 0, padding = 0 } = params;
+  const {
+    container,
+    app,
+    videoSprite,
+    maskGraphics,
+    videoElement,
+    cropRegion,
+    lockedVideoDimensions,
+    borderRadius = 0,
+    padding = 0,
+    sceneFrameStyle = 'none',
+    sceneFrameThickness = 12,
+  } = params;
 
   const videoWidth = lockedVideoDimensions?.width || videoElement.videoWidth;
   const videoHeight = lockedVideoDimensions?.height || videoElement.videoHeight;
@@ -62,11 +78,20 @@ export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
   const cropEndX = cropStartX + croppedVideoWidth;
   const cropEndY = cropStartY + croppedVideoHeight;
   
-  // Calculate scale to fit the cropped area in the viewport
-  // Padding is a percentage (0-100), where 50 matches the original VIEWPORT_SCALE of 0.8
-  const paddingScale = 1.0 - (padding / 100) * 0.4;
-  const maxDisplayWidth = width * paddingScale;
-  const maxDisplayHeight = height * paddingScale;
+  const contentAspectRatio = croppedVideoHeight > 0
+    ? croppedVideoWidth / croppedVideoHeight
+    : videoWidth / videoHeight;
+  const sceneFrameLayout = computeSceneFrameLayout({
+    containerWidth: width,
+    containerHeight: height,
+    padding,
+    contentAspectRatio,
+    borderRadius,
+    frameStyle: sceneFrameStyle,
+    frameThickness: sceneFrameThickness,
+  });
+  const maxDisplayWidth = sceneFrameLayout.contentRect.width;
+  const maxDisplayHeight = sceneFrameLayout.contentRect.height;
 
   const scale = Math.min(
     maxDisplayWidth / croppedVideoWidth,
@@ -84,8 +109,12 @@ export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
   const croppedDisplayHeight = croppedVideoHeight * scale;
 
   // Center the cropped region in the container
-  const centerOffsetX = (width - croppedDisplayWidth) / 2;
-  const centerOffsetY = (height - croppedDisplayHeight) / 2;
+  const centerOffsetX =
+    sceneFrameLayout.contentRect.x +
+    (sceneFrameLayout.contentRect.width - croppedDisplayWidth) / 2;
+  const centerOffsetY =
+    sceneFrameLayout.contentRect.y +
+    (sceneFrameLayout.contentRect.height - croppedDisplayHeight) / 2;
   
   // Position the full video sprite so that when we apply the mask,
   // the cropped region appears centered
@@ -108,7 +137,7 @@ export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
     y: maskY,
     width: croppedDisplayWidth,
     height: croppedDisplayHeight,
-    radius: borderRadius,
+    radius: sceneFrameLayout.contentRadius,
   });
   maskGraphics.fill({ color: 0xffffff });
 
@@ -125,6 +154,7 @@ export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
       sourceCrop: crop,
     },
     cropBounds: { startX: cropStartX, endX: cropEndX, startY: cropStartY, endY: cropEndY },
+    sceneFrameLayout,
   };
 }
 
