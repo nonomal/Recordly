@@ -50,7 +50,11 @@ interface UpdateToastState {
 	delayMs: number;
 	isPreview?: boolean;
 	progressPercent?: number;
-	primaryAction?: "download-update" | "install-update" | "retry-check";
+	transferredBytes?: number;
+	totalBytes?: number;
+	remainingBytes?: number;
+	bytesPerSecond?: number;
+	primaryAction?: "install-and-restart" | "retry-check";
 }
 
 interface UpdateStatusSummary {
@@ -88,6 +92,10 @@ interface Window {
 		setHudOverlayCompactWidth: (width: number) => void;
 		setHudOverlayMeasuredHeight: (height: number, expanded: boolean) => void;
 		getHudOverlayCaptureProtection: () => Promise<{ success: boolean; enabled: boolean }>;
+		getHudOverlayMousePassthroughSupported: () => Promise<{
+			success: boolean;
+			supported: boolean;
+		}>;
 		setHudOverlayCaptureProtection: (
 			enabled: boolean,
 		) => Promise<{ success: boolean; enabled: boolean }>;
@@ -206,7 +214,7 @@ interface Window {
 			},
 		) => Promise<{
 			success: boolean;
-			data?: Uint8Array;
+			tempPath?: string;
 			encoderName?: string;
 			error?: string;
 			metrics?: RendererFfmpegAudioMuxMetrics;
@@ -232,9 +240,57 @@ interface Window {
 			error?: string;
 			metrics?: RendererFfmpegAudioMuxMetrics;
 		}>;
-		getVideoAudioFallbackPaths: (
+		muxExportedVideoAudioFromPath: (
 			videoPath: string,
+			options?: {
+				audioMode?: "none" | "copy-source" | "trim-source" | "edited-track";
+				audioSourcePath?: string | null;
+				audioSourceSampleRate?: number;
+				trimSegments?: Array<{ startMs: number; endMs: number }>;
+				editedTrackStrategy?: "filtergraph-fast-path" | "offline-render-fallback";
+				editedTrackSegments?: Array<{ startMs: number; endMs: number; speed: number }>;
+				editedAudioData?: ArrayBuffer;
+				editedAudioMimeType?: string | null;
+			},
 		) => Promise<{
+			success: boolean;
+			tempPath?: string;
+			error?: string;
+			metrics?: RendererFfmpegAudioMuxMetrics;
+		}>;
+		openExportStream: (options?: { extension?: string }) => Promise<{
+			success: boolean;
+			streamId?: string;
+			tempPath?: string;
+			error?: string;
+		}>;
+		writeExportStreamChunk: (
+			streamId: string,
+			position: number,
+			chunk: Uint8Array,
+		) => Promise<{ success: boolean; error?: string }>;
+		closeExportStream: (
+			streamId: string,
+			options?: { abort?: boolean },
+		) => Promise<{
+			success: boolean;
+			tempPath?: string;
+			bytesWritten?: number;
+			error?: string;
+		}>;
+		finalizeExportedVideo: (payload: {
+			tempPath: string;
+			fileName: string;
+			outputPath?: string | null;
+		}) => Promise<{
+			success: boolean;
+			path?: string;
+			canceled?: boolean;
+			message?: string;
+			error?: string;
+		}>;
+		discardExportedTemp: (tempPath: string) => Promise<{ success: boolean; error?: string }>;
+		getVideoAudioFallbackPaths: (videoPath: string) => Promise<{
 			success: boolean;
 			paths: string[];
 			startDelayMsByPath?: Record<string, number>;
@@ -342,12 +398,15 @@ interface Window {
 			message?: string;
 			error?: string;
 		}>;
-		setCurrentVideoPath: (path: string) => Promise<{ success: boolean }>;
+		setCurrentVideoPath: (
+			path: string,
+			options?: { preserveProjectPath?: boolean },
+		) => Promise<{ success: boolean; webcamPath: string | null }>;
 		setCurrentRecordingSession: (session: {
 			videoPath: string;
 			webcamPath?: string | null;
 			timeOffsetMs?: number;
-		}) => Promise<{ success: boolean }>;
+		}, options?: { preserveProjectPath?: boolean }) => Promise<{ success: boolean }>;
 		getCurrentRecordingSession: () => Promise<{
 			success: boolean;
 			session?: { videoPath: string; webcamPath?: string | null; timeOffsetMs?: number };
@@ -432,7 +491,9 @@ interface Window {
 			error?: string;
 		}>;
 		installDownloadedUpdate: () => Promise<{ success: boolean }>;
-		downloadAvailableUpdate: () => Promise<{ success: boolean; message?: string }>;
+		downloadAvailableUpdate: (
+			installAfterDownload?: boolean,
+		) => Promise<{ success: boolean; message?: string }>;
 		deferDownloadedUpdate: (delayMs?: number) => Promise<{
 			success: boolean;
 			message?: string;

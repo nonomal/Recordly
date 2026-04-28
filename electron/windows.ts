@@ -34,8 +34,8 @@ const HUD_SHADOW_BLEED_DIP = 36;
 const HUD_MIN_WINDOW_WIDTH = 560;
 const HUD_COMPACT_HEIGHT = 96;
 const HUD_MIN_EXPANDED_HEIGHT = 520 + HUD_SHADOW_BLEED_DIP;
-const UPDATE_TOAST_WIDTH = 420;
-const UPDATE_TOAST_HEIGHT = 212;
+const UPDATE_TOAST_WIDTH = 456;
+const UPDATE_TOAST_HEIGHT = 252;
 const UPDATE_TOAST_GAP_DIP = 18;
 
 let hudOverlayExpanded = false;
@@ -88,6 +88,15 @@ function getEditorWindowQuery(): Record<string, string> {
 		}
 		if (process.env.RECORDLY_SMOKE_EXPORT_MAX_PENDING_FRAMES) {
 			query.smokeMaxPendingFrames = process.env.RECORDLY_SMOKE_EXPORT_MAX_PENDING_FRAMES;
+		}
+		if (process.env.RECORDLY_SMOKE_EXPORT_PROJECT) {
+			query.smokeProject = process.env.RECORDLY_SMOKE_EXPORT_PROJECT;
+		}
+		if (process.env.RECORDLY_SMOKE_EXPORT_QUALITY) {
+			query.smokeQuality = process.env.RECORDLY_SMOKE_EXPORT_QUALITY;
+		}
+		if (process.env.RECORDLY_SMOKE_EXPORT_FPS) {
+			query.smokeFps = process.env.RECORDLY_SMOKE_EXPORT_FPS;
 		}
 	}
 
@@ -410,6 +419,13 @@ ipcMain.handle("get-hud-overlay-capture-protection", () => {
 	return {
 		success: true,
 		enabled,
+	};
+});
+
+ipcMain.handle("get-hud-overlay-mouse-passthrough-supported", () => {
+	return {
+		success: true,
+		supported: isHudOverlayMousePassthroughSupported(),
 	};
 });
 

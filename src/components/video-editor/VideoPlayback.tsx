@@ -18,8 +18,8 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { getAssetPath, getRenderableAssetUrl } from "@/lib/assetPath";
-import { clampMediaTimeToDuration } from "@/lib/mediaTiming";
+import { getAssetPath, getRenderableAssetUrl, getRenderableVideoUrl } from "@/lib/assetPath";
+import { clampMediaTimeToDuration, getMediaSyncPlaybackRate } from "@/lib/mediaTiming";
 import {
 	DEFAULT_WALLPAPER_PATH,
 	DEFAULT_WALLPAPER_RELATIVE_PATH,
@@ -101,6 +101,7 @@ import {
 	DEFAULT_CURSOR_SIZE,
 	DEFAULT_CURSOR_SMOOTHING,
 	DEFAULT_CURSOR_SWAY,
+	DEFAULT_PADDING,
 	DEFAULT_WEBCAM_CORNER_RADIUS,
 	DEFAULT_WEBCAM_REACT_TO_ZOOM,
 	DEFAULT_WEBCAM_SHADOW,
@@ -110,7 +111,6 @@ import {
 	DEFAULT_ZOOM_IN_OVERLAP_MS,
 	DEFAULT_ZOOM_OUT_DURATION_MS,
 	DEFAULT_ZOOM_OUT_EASING,
-	DEFAULT_PADDING,
 	getDefaultCaptionFontFamily,
 } from "./types";
 import {
@@ -124,6 +124,7 @@ import { clampFocusToStage as clampFocusToStageUtil } from "./videoPlayback/focu
 import { layoutVideoContent as layoutVideoContentUtil } from "./videoPlayback/layoutUtils";
 import { updateOverlayIndicator } from "./videoPlayback/overlayUtils";
 import { createVideoEventHandlers } from "./videoPlayback/videoEventHandlers";
+import { getWebcamMediaTargetTimeSeconds } from "./videoPlayback/webcamSync";
 import { findDominantRegion } from "./videoPlayback/zoomRegionUtils";
 import {
 	applyZoomTransform,
@@ -397,6 +398,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const trimRegionsRef = useRef<TrimRegion[]>([]);
 		const speedRegionsRef = useRef<SpeedRegion[]>([]);
 		const lastWebcamSyncTimeRef = useRef<number | null>(null);
+		const lastBackgroundSyncTimeRef = useRef<number | null>(null);
 		const bgVideoRef = useRef<HTMLVideoElement | null>(null);
 		const zoomMotionBlurRef = useRef(zoomMotionBlur);
 		const connectZoomsRef = useRef(connectZooms);
@@ -1005,13 +1007,57 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			}
 		}, [isPlaying]);
 
-		// Sync background video wallpaper with timeline scrubbing
+		// Keep video wallpapers locked to the same source timestamp as the main clip.
 		useEffect(() => {
 			const bgVideo = bgVideoRef.current;
 			if (!bgVideo) return;
-			if (!isPlaying && bgVideo.duration && Number.isFinite(bgVideo.duration)) {
-				bgVideo.currentTime = currentTime % bgVideo.duration;
+
+			const clipTimelineTime = currentTime;
+			const videoDuration =
+				Number.isFinite(bgVideo.duration) && bgVideo.duration > 0 ? bgVideo.duration : null;
+			const targetTime = videoDuration
+				? clipTimelineTime % videoDuration
+				: clampMediaTimeToDuration(clipTimelineTime, videoDuration);
+
+			const activeSpeedRegion = speedRegionsRef.current.find(
+				(region) => currentTime * 1000 >= region.startMs && currentTime * 1000 < region.endMs,
+			);
+			const targetPlaybackRate = activeSpeedRegion ? activeSpeedRegion.speed : 1;
+			const syncedPlaybackRate = getMediaSyncPlaybackRate({
+				basePlaybackRate: targetPlaybackRate,
+				currentTime: bgVideo.currentTime,
+				targetTime,
+				toleranceSeconds: 0.02,
+				correctionWindowSeconds: 1.5,
+				maxAdjustment: 0.12,
+			});
+			if (Math.abs(bgVideo.playbackRate - syncedPlaybackRate) > 0.001) {
+				bgVideo.playbackRate = syncedPlaybackRate;
 			}
+
+			const previousTimelineTime = lastBackgroundSyncTimeRef.current;
+			const timelineJumped =
+				previousTimelineTime === null ||
+				Math.abs(clipTimelineTime - previousTimelineTime) > 0.25;
+			const driftThreshold = isPlaying ? 0.35 : 0.01;
+			if (timelineJumped || Math.abs(bgVideo.currentTime - targetTime) > driftThreshold) {
+				try {
+					bgVideo.currentTime = targetTime;
+				} catch {
+					// no-op
+				}
+			}
+
+			if (isPlaying) {
+				const playPromise = bgVideo.play();
+				if (playPromise) {
+					playPromise.catch(() => undefined);
+				}
+			} else {
+				bgVideo.pause();
+			}
+
+			lastBackgroundSyncTimeRef.current = clipTimelineTime;
 		}, [currentTime, isPlaying]);
 
 		useEffect(() => {
@@ -1232,10 +1278,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				return;
 			}
 
-			const targetTime = clampMediaTimeToDuration(
+			const targetTime = getWebcamMediaTargetTimeSeconds({
 				currentTime,
-				Number.isFinite(webcamVideo.duration) ? webcamVideo.duration : null,
-			);
+				webcamDuration: Number.isFinite(webcamVideo.duration) ? webcamVideo.duration : null,
+				timeOffsetMs: webcam.timeOffsetMs,
+			});
 
 			const activeSpeedRegion = speedRegionsRef.current.find(
 				(region) => targetTime * 1000 >= region.startMs && targetTime * 1000 < region.endMs,
@@ -1272,6 +1319,10 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		useEffect(() => {
 			lastWebcamSyncTimeRef.current = null;
 		}, [webcamVideoPath]);
+
+		useEffect(() => {
+			lastBackgroundSyncTimeRef.current = null;
+		}, [wallpaper]);
 
 		useEffect(() => {
 			const overlayEl = overlayRef.current;
@@ -1470,7 +1521,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			layoutVideoContent();
 			video.pause();
 
-			const { handlePlay, handlePause, handleSeeked, handleSeeking } =
+			const { handlePlay, handlePause, handleSeeked, handleSeeking, dispose } =
 				createVideoEventHandlers({
 					video,
 					isSeekingRef,
@@ -1496,10 +1547,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				video.removeEventListener("ended", handlePause);
 				video.removeEventListener("seeked", handleSeeked);
 				video.removeEventListener("seeking", handleSeeking);
-
-				if (timeUpdateAnimationRef.current) {
-					cancelAnimationFrame(timeUpdateAnimationRef.current);
-				}
+				dispose();
 
 				if (videoSprite) {
 					videoContainer.removeChild(videoSprite);
@@ -1749,9 +1797,13 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				// through an intermediate RenderTexture at renderer resolution, which
 				// downsamples the native video and degrades preview quality.
 				// Hysteresis prevents flickering when motionIntensity oscillates near threshold.
-				const filtersActive = Array.isArray(videoContainer.filters) && videoContainer.filters.length > 0;
-				const cameraIsMoving = filtersActive ? motionIntensity > 0.002 : motionIntensity > 0.008;
-				const needsFilters = zoomMotionBlurRef.current > 0 && isPlayingRef.current && cameraIsMoving;
+				const filtersActive =
+					Array.isArray(videoContainer.filters) && videoContainer.filters.length > 0;
+				const cameraIsMoving = filtersActive
+					? motionIntensity > 0.002
+					: motionIntensity > 0.008;
+				const needsFilters =
+					zoomMotionBlurRef.current > 0 && isPlayingRef.current && cameraIsMoving;
 				if (needsFilters && !filtersActive && motionBlurFilterRef.current) {
 					videoContainer.filters = [motionBlurFilterRef.current];
 				} else if (!needsFilters && filtersActive) {
@@ -2116,10 +2168,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					}
 
 					if (isVideoWallpaperSource(wallpaper)) {
-						let videoSrc = wallpaper;
-						if (wallpaper.startsWith("/") && !wallpaper.startsWith("//")) {
-							videoSrc = await getAssetPath(wallpaper.replace(/^\//, ""));
-						}
+						const videoSrc = await getRenderableVideoUrl(wallpaper);
 						if (mounted) {
 							setResolvedWallpaper(videoSrc);
 							setResolvedWallpaperKind("video");
@@ -2451,12 +2500,15 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 						})()}
 					</div>
 				)}
+				{/* Keep the source video off-screen instead of display:none so the
+					browser continues producing presented frames for Pixi and preview sync. */}
 				<video
 					ref={videoRef}
 					src={videoPath}
-					className="hidden"
+					className="pointer-events-none absolute left-0 top-0 h-px w-px opacity-0"
 					preload="metadata"
 					playsInline
+					aria-hidden="true"
 					onLoadedMetadata={handleLoadedMetadata}
 					onDurationChange={(e) => {
 						onDurationChange(e.currentTarget.duration);

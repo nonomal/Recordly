@@ -96,6 +96,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	getHudOverlayCaptureProtection: () => {
 		return ipcRenderer.invoke("get-hud-overlay-capture-protection");
 	},
+	getHudOverlayMousePassthroughSupported: () => {
+		return ipcRenderer.invoke("get-hud-overlay-mouse-passthrough-supported");
+	},
 	setHudOverlayCaptureProtection: (enabled: boolean) => {
 		return ipcRenderer.invoke("set-hud-overlay-capture-protection", enabled);
 	},
@@ -203,6 +206,37 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			error?: string;
 			metrics?: NativeVideoAudioMuxMetrics;
 		}>;
+	},
+	muxExportedVideoAudioFromPath: (
+		videoPath: string,
+		options?: {
+			audioMode?: "none" | "copy-source" | "trim-source" | "edited-track";
+			audioSourcePath?: string | null;
+			trimSegments?: Array<{ startMs: number; endMs: number }>;
+			editedAudioData?: ArrayBuffer;
+			editedAudioMimeType?: string | null;
+		},
+	) => {
+		return ipcRenderer.invoke("mux-exported-video-audio-from-path", videoPath, options);
+	},
+	openExportStream: (options?: { extension?: string }) => {
+		return ipcRenderer.invoke("export-stream-open", options);
+	},
+	writeExportStreamChunk: (streamId: string, position: number, chunk: Uint8Array) => {
+		return ipcRenderer.invoke("export-stream-write", streamId, position, chunk);
+	},
+	closeExportStream: (streamId: string, options?: { abort?: boolean }) => {
+		return ipcRenderer.invoke("export-stream-close", streamId, options);
+	},
+	finalizeExportedVideo: (payload: {
+		tempPath: string;
+		fileName: string;
+		outputPath?: string | null;
+	}) => {
+		return ipcRenderer.invoke("finalize-exported-video", payload);
+	},
+	discardExportedTemp: (tempPath: string) => {
+		return ipcRenderer.invoke("discard-exported-temp", tempPath);
 	},
 	getVideoAudioFallbackPaths: (videoPath: string) => {
 		return ipcRenderer.invoke("get-video-audio-fallback-paths", videoPath);
@@ -396,15 +430,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	}) => {
 		return ipcRenderer.invoke("generate-auto-captions", options);
 	},
-	setCurrentVideoPath: (path: string) => {
-		return ipcRenderer.invoke("set-current-video-path", path);
+	setCurrentVideoPath: (path: string, options?: { preserveProjectPath?: boolean }) => {
+		return ipcRenderer.invoke("set-current-video-path", path, options);
 	},
 	setCurrentRecordingSession: (session: {
 		videoPath: string;
 		webcamPath?: string | null;
 		timeOffsetMs?: number;
-	}) => {
-		return ipcRenderer.invoke("set-current-recording-session", session);
+	}, options?: { preserveProjectPath?: boolean }) => {
+		return ipcRenderer.invoke("set-current-recording-session", session, options);
 	},
 	getCurrentRecordingSession: () => {
 		return ipcRenderer.invoke("get-current-recording-session");
@@ -470,8 +504,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	installDownloadedUpdate: () => {
 		return ipcRenderer.invoke("install-downloaded-update");
 	},
-	downloadAvailableUpdate: () => {
-		return ipcRenderer.invoke("download-available-update");
+	downloadAvailableUpdate: (installAfterDownload?: boolean) => {
+		return ipcRenderer.invoke("download-available-update", installAfterDownload);
 	},
 	deferDownloadedUpdate: (delayMs?: number) => {
 		return ipcRenderer.invoke("defer-downloaded-update", delayMs);
@@ -503,7 +537,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
 				delayMs: number;
 				isPreview?: boolean;
 				progressPercent?: number;
-				primaryAction?: "download-update" | "install-update" | "retry-check";
+				transferredBytes?: number;
+				totalBytes?: number;
+				remainingBytes?: number;
+				bytesPerSecond?: number;
+				primaryAction?: "install-and-restart" | "retry-check";
 			} | null,
 		) => void,
 	) => {
@@ -516,7 +554,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
 				delayMs: number;
 				isPreview?: boolean;
 				progressPercent?: number;
-				primaryAction?: "download-update" | "install-update" | "retry-check";
+				transferredBytes?: number;
+				totalBytes?: number;
+				remainingBytes?: number;
+				bytesPerSecond?: number;
+				primaryAction?: "install-and-restart" | "retry-check";
 			} | null,
 		) => callback(payload);
 		ipcRenderer.on("update-toast-state", listener);

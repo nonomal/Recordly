@@ -54,6 +54,14 @@ import nlLaunch from "@/i18n/locales/nl/launch.json";
 import nlSettings from "@/i18n/locales/nl/settings.json";
 import nlShortcuts from "@/i18n/locales/nl/shortcuts.json";
 import nlTimeline from "@/i18n/locales/nl/timeline.json";
+import ptBRCommon from "@/i18n/locales/pt-BR/common.json";
+import ptBRDialogs from "@/i18n/locales/pt-BR/dialogs.json";
+import ptBREditor from "@/i18n/locales/pt-BR/editor.json";
+import ptBRExtensions from "@/i18n/locales/pt-BR/extensions.json";
+import ptBRLaunch from "@/i18n/locales/pt-BR/launch.json";
+import ptBRSettings from "@/i18n/locales/pt-BR/settings.json";
+import ptBRShortcuts from "@/i18n/locales/pt-BR/shortcuts.json";
+import ptBRTimeline from "@/i18n/locales/pt-BR/timeline.json";
 import zhCNCommon from "@/i18n/locales/zh-CN/common.json";
 import zhCNDialogs from "@/i18n/locales/zh-CN/dialogs.json";
 import zhCNEditor from "@/i18n/locales/zh-CN/editor.json";
@@ -62,6 +70,14 @@ import zhCNLaunch from "@/i18n/locales/zh-CN/launch.json";
 import zhCNSettings from "@/i18n/locales/zh-CN/settings.json";
 import zhCNShortcuts from "@/i18n/locales/zh-CN/shortcuts.json";
 import zhCNTimeline from "@/i18n/locales/zh-CN/timeline.json";
+import zhTWCommon from "@/i18n/locales/zh-TW/common.json";
+import zhTWDialogs from "@/i18n/locales/zh-TW/dialogs.json";
+import zhTWEditor from "@/i18n/locales/zh-TW/editor.json";
+import zhTWExtensions from "@/i18n/locales/zh-TW/extensions.json";
+import zhTWLaunch from "@/i18n/locales/zh-TW/launch.json";
+import zhTWSettings from "@/i18n/locales/zh-TW/settings.json";
+import zhTWShortcuts from "@/i18n/locales/zh-TW/shortcuts.json";
+import zhTWTimeline from "@/i18n/locales/zh-TW/timeline.json";
 
 const LOCALE_STORAGE_KEY = "recordly.locale";
 
@@ -118,6 +134,16 @@ const messages: Record<AppLocale, LocaleBundle> = {
 		shortcuts: koShortcuts,
 		extensions: koExtensions,
 	},
+	"pt-BR": {
+		common: ptBRCommon,
+		launch: ptBRLaunch,
+		editor: ptBREditor,
+		timeline: ptBRTimeline,
+		settings: ptBRSettings,
+		dialogs: ptBRDialogs,
+		shortcuts: ptBRShortcuts,
+		extensions: ptBRExtensions,
+	},
 	"zh-CN": {
 		common: zhCNCommon,
 		launch: zhCNLaunch,
@@ -127,6 +153,16 @@ const messages: Record<AppLocale, LocaleBundle> = {
 		dialogs: zhCNDialogs,
 		shortcuts: zhCNShortcuts,
 		extensions: zhCNExtensions,
+	},
+		"zh-TW": {
+		common: zhTWCommon,
+		launch: zhTWLaunch,
+		editor: zhTWEditor,
+		timeline: zhTWTimeline,
+		settings: zhTWSettings,
+		dialogs: zhTWDialogs,
+		shortcuts: zhTWShortcuts,
+		extensions: zhTWExtensions,
 	},
 } as const;
 

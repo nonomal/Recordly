@@ -57,6 +57,7 @@ import {
 	GifExporter,
 	type GifFrameRate,
 	type GifSizePreset,
+	isValidMp4FrameRate,
 	ModernVideoExporter,
 	probeSupportedMp4Dimensions,
 	type SupportedMp4Dimensions,
@@ -148,6 +149,7 @@ import {
 	DEFAULT_FIGURE_DATA,
 	DEFAULT_PLAYBACK_SPEED,
 	DEFAULT_WEBCAM_OVERLAY,
+	DEFAULT_WEBCAM_TIME_OFFSET_MS,
 	DEFAULT_ZOOM_DEPTH,
 	DEFAULT_ZOOM_IN_DURATION_MS,
 	DEFAULT_ZOOM_IN_EASING,
@@ -192,7 +194,12 @@ type EditorHistorySnapshot = {
 
 type PendingExportSave = {
 	fileName: string;
-	arrayBuffer: ArrayBuffer;
+	// Exactly one of these is populated. `tempFilePath` is the preferred form
+	// for MP4 exports — the main process holds the finished file on disk, so
+	// "Save Again" just renames it instead of round-tripping through the
+	// renderer's ArrayBuffer heap.
+	arrayBuffer?: ArrayBuffer;
+	tempFilePath?: string;
 };
 
 type CancelableExporter = {
@@ -214,6 +221,16 @@ type SmokeExportConfig = {
 	maxEncodeQueue?: number;
 	maxDecodeQueue?: number;
 	maxPendingFrames?: number;
+	projectPath?: string | null;
+	quality?: ExportQuality;
+	fps?: ExportMp4FrameRate;
+};
+
+type SaveProjectOptions = {
+	silent?: boolean;
+	remountPreviewAfterSave?: boolean;
+	refreshLibraryAfterSave?: boolean;
+	captureThumbnail?: boolean;
 };
 
 async function writeSmokeExportReport(
@@ -241,6 +258,7 @@ async function writeSmokeExportReport(
 
 const DEFAULT_MP4_EXPORT_FRAME_RATE: ExportMp4FrameRate = 30;
 const SOURCE_AUDIO_FALLBACK_TOAST_ID = "source-audio-fallback-error";
+const PROJECT_AUTOSAVE_DELAY_MS = 1000;
 
 function getEncodingModeBitrateMultiplier(encodingMode: ExportEncodingMode): number {
 	switch (encodingMode) {
@@ -283,6 +301,19 @@ function parseSmokeExportNonNegativeNumber(value: string | null): number | undef
 
 	const parsed = Number.parseFloat(value);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function parseSmokeExportQuality(value: string | null): ExportQuality | undefined {
+	if (value === "medium" || value === "good" || value === "high" || value === "source") {
+		return value;
+	}
+	return undefined;
+}
+
+function parseSmokeExportFps(value: string | null): ExportMp4FrameRate | undefined {
+	if (value === null) return undefined;
+	const parsed = Number.parseInt(value, 10);
+	return isValidMp4FrameRate(parsed) ? parsed : undefined;
 }
 
 function getSmokeExportConfig(search: string): SmokeExportConfig {
@@ -335,6 +366,9 @@ function getSmokeExportConfig(search: string): SmokeExportConfig {
 		maxPendingFrames: enabled
 			? parseSmokeExportNumber(params.get("smokeMaxPendingFrames"))
 			: undefined,
+		projectPath: enabled ? params.get("smokeProject") : null,
+		quality: enabled ? parseSmokeExportQuality(params.get("smokeQuality")) : undefined,
+		fps: enabled ? parseSmokeExportFps(params.get("smokeFps")) : undefined,
 	};
 }
 
@@ -561,6 +595,12 @@ export default function VideoEditor() {
 	const [resolvedWebcamVideoUrl, setResolvedWebcamVideoUrl] = useState<string | null>(null);
 	const [zoomRegions, setZoomRegions] = useState<ZoomRegion[]>([]);
 	const [cursorTelemetry, setCursorTelemetry] = useState<CursorTelemetryPoint[]>([]);
+	// Tracks the videoSourcePath for which the cursor telemetry IPC has already
+	// resolved. The smoke-export auto-trigger waits on this so long recordings
+	// still bake cursor/zoom animations into the output — without it, the
+	// auto-export fires as soon as the video loads and the telemetry arrives
+	// after encoding has started.
+	const [cursorTelemetrySourcePath, setCursorTelemetrySourcePath] = useState<string | null>(null);
 	const [selectedZoomId, setSelectedZoomId] = useState<string | null>(null);
 	const [trimRegions, setTrimRegions] = useState<TrimRegion[]>([]);
 	const [selectedTrimId, setSelectedTrimId] = useState<string | null>(null);
@@ -663,6 +703,8 @@ export default function VideoEditor() {
 	const cropSnapshotRef = useRef<CropRegion | null>(null);
 	const mp4SupportRequestRef = useRef(0);
 	const smokeExportStartedRef = useRef(false);
+	const projectAutosaveTimeoutRef = useRef<number | null>(null);
+	const projectSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
 	const [historyVersion, setHistoryVersion] = useState(0);
 	const timelineRef = useRef<TimelineEditorHandle>(null);
 
@@ -708,8 +750,14 @@ export default function VideoEditor() {
 	}, []);
 
 	const clearPendingExportSave = useCallback(() => {
+		const pending = pendingExportSaveRef.current;
 		pendingExportSaveRef.current = null;
 		setHasPendingExportSave(false);
+		if (pending?.tempFilePath && typeof window !== "undefined") {
+			// Best-effort cleanup — main-process also reaps stale temp files on
+			// before-quit, so we ignore failures here.
+			void window.electronAPI.discardExportedTemp?.(pending.tempFilePath);
+		}
 	}, []);
 
 	const refreshProjectLibrary = useCallback(async () => {
@@ -909,6 +957,7 @@ export default function VideoEditor() {
 		cursorTelemetry,
 		clipRegions,
 		padding,
+		resolvedWebcamVideoUrl,
 		shadowIntensity,
 		showCursor,
 		speedRegions,
@@ -943,11 +992,28 @@ export default function VideoEditor() {
 		setPreviewVersion((version) => version + 1);
 	}, []);
 
+	const clearPendingProjectAutosave = useCallback(() => {
+		if (projectAutosaveTimeoutRef.current !== null) {
+			window.clearTimeout(projectAutosaveTimeoutRef.current);
+			projectAutosaveTimeoutRef.current = null;
+		}
+	}, []);
+
+	const queueProjectSave = useCallback((task: () => Promise<boolean>) => {
+		const run = projectSaveQueueRef.current.catch(() => undefined).then(task);
+		projectSaveQueueRef.current = run.catch(() => undefined);
+		return run;
+	}, []);
+
 	useEffect(() => {
 		return () => {
 			exporterRef.current?.cancel();
 			exporterRef.current = null;
+			const pending = pendingExportSaveRef.current;
 			pendingExportSaveRef.current = null;
+			if (pending?.tempFilePath && typeof window !== "undefined") {
+				void window.electronAPI.discardExportedTemp?.(pending.tempFilePath);
+			}
 			if (pendingTelemetryRetryTimeoutRef.current !== null) {
 				window.clearTimeout(pendingTelemetryRetryTimeoutRef.current);
 				pendingTelemetryRetryTimeoutRef.current = null;
@@ -955,6 +1021,10 @@ export default function VideoEditor() {
 			if (pendingFreshRecordingAutoSuggestTimeoutRef.current !== null) {
 				window.clearTimeout(pendingFreshRecordingAutoSuggestTimeoutRef.current);
 				pendingFreshRecordingAutoSuggestTimeoutRef.current = null;
+			}
+			if (projectAutosaveTimeoutRef.current !== null) {
+				window.clearTimeout(projectAutosaveTimeoutRef.current);
+				projectAutosaveTimeoutRef.current = null;
 			}
 		};
 	}, []);
@@ -1518,19 +1588,24 @@ export default function VideoEditor() {
 			setCurrentTime(0);
 			setDuration(0);
 
-			setError(null);
-			setVideoSourcePath(sourcePath);
-			setVideoPath(await resolveVideoUrl(sourcePath));
-			setCurrentProjectPath(path ?? null);
-			pendingFreshRecordingAutoZoomPathRef.current = null;
-			if (normalizedEditor.webcam.sourcePath) {
-				await window.electronAPI.setCurrentRecordingSession?.({
-					videoPath: sourcePath,
-					webcamPath: normalizedEditor.webcam.sourcePath,
-				});
-			} else {
-				await window.electronAPI.setCurrentVideoPath(sourcePath);
-			}
+				setError(null);
+				setVideoSourcePath(sourcePath);
+				setVideoPath(await resolveVideoUrl(sourcePath));
+				setCurrentProjectPath(path ?? null);
+				pendingFreshRecordingAutoZoomPathRef.current = null;
+				if (normalizedEditor.webcam.sourcePath) {
+					await window.electronAPI.setCurrentRecordingSession?.({
+						videoPath: sourcePath,
+						webcamPath: normalizedEditor.webcam.sourcePath,
+						timeOffsetMs: normalizedEditor.webcam.timeOffsetMs,
+					}, {
+						preserveProjectPath: Boolean(path),
+					});
+				} else {
+					await window.electronAPI.setCurrentVideoPath(sourcePath, {
+						preserveProjectPath: Boolean(path),
+					});
+				}
 
 			setWallpaper(normalizedEditor.wallpaper);
 			setShadowIntensity(normalizedEditor.shadowIntensity);
@@ -1653,7 +1728,7 @@ export default function VideoEditor() {
 	}, [currentPersistedEditorState, currentSourcePath, lastSavedSnapshot?.projectId]);
 
 	const syncRecordingSessionWebcam = useCallback(
-		async (webcamPath: string | null) => {
+		async (webcamPath: string | null, timeOffsetMs?: number) => {
 			if (!currentSourcePath || !window.electronAPI.setCurrentRecordingSession) {
 				return;
 			}
@@ -1661,9 +1736,17 @@ export default function VideoEditor() {
 			await window.electronAPI.setCurrentRecordingSession({
 				videoPath: currentSourcePath,
 				webcamPath,
+				timeOffsetMs:
+					webcamPath && Number.isFinite(timeOffsetMs)
+						? (timeOffsetMs ?? DEFAULT_WEBCAM_TIME_OFFSET_MS)
+						: webcamPath
+							? webcam.timeOffsetMs
+							: DEFAULT_WEBCAM_TIME_OFFSET_MS,
+			}, {
+				preserveProjectPath: Boolean(currentProjectPath),
 			});
 		},
-		[currentSourcePath],
+		[currentProjectPath, currentSourcePath, webcam.timeOffsetMs],
 	);
 
 	const syncActiveVideoSource = useCallback(
@@ -1672,13 +1755,18 @@ export default function VideoEditor() {
 				await window.electronAPI.setCurrentRecordingSession?.({
 					videoPath: sourcePath,
 					webcamPath,
+					timeOffsetMs: webcam.timeOffsetMs,
+				}, {
+					preserveProjectPath: Boolean(currentProjectPath),
 				});
 				return;
 			}
 
-			await window.electronAPI.setCurrentVideoPath(sourcePath);
+			await window.electronAPI.setCurrentVideoPath(sourcePath, {
+				preserveProjectPath: Boolean(currentProjectPath),
+			});
 		},
-		[],
+		[currentProjectPath, webcam.timeOffsetMs],
 	);
 
 	const handleUploadWebcam = useCallback(async () => {
@@ -1691,9 +1779,10 @@ export default function VideoEditor() {
 			...prev,
 			enabled: true,
 			sourcePath: result.path ?? null,
+			timeOffsetMs: DEFAULT_WEBCAM_TIME_OFFSET_MS,
 		}));
 
-		await syncRecordingSessionWebcam(result.path);
+		await syncRecordingSessionWebcam(result.path, DEFAULT_WEBCAM_TIME_OFFSET_MS);
 		toast.success(t("settings.effects.webcamFootageAdded"));
 	}, [syncRecordingSessionWebcam, t]);
 
@@ -1702,6 +1791,7 @@ export default function VideoEditor() {
 			...prev,
 			enabled: false,
 			sourcePath: null,
+			timeOffsetMs: DEFAULT_WEBCAM_TIME_OFFSET_MS,
 		}));
 
 		await syncRecordingSessionWebcam(null);
@@ -1750,6 +1840,32 @@ export default function VideoEditor() {
 	useEffect(() => {
 		async function loadInitialData() {
 			try {
+				if (smokeExportConfig.enabled && smokeExportConfig.projectPath) {
+					const projectResult = await window.electronAPI.openProjectFileAtPath(
+						smokeExportConfig.projectPath,
+					);
+					if (!projectResult.success || !projectResult.project) {
+						setError(
+							`Smoke export failed to load project ${smokeExportConfig.projectPath}: ${
+								projectResult.error || projectResult.message || "unknown error"
+							}`,
+						);
+						return;
+					}
+					const restored = await applyLoadedProject(
+						projectResult.project,
+						projectResult.path ?? smokeExportConfig.projectPath,
+					);
+					if (!restored) {
+						setError(
+							`Smoke export could not apply project ${smokeExportConfig.projectPath}`,
+						);
+						return;
+					}
+					setError(null);
+					return;
+				}
+
 				if (smokeExportConfig.enabled) {
 					if (!smokeExportConfig.inputPath) {
 						setError("Smoke export input path is missing.");
@@ -1770,6 +1886,7 @@ export default function VideoEditor() {
 						...prev,
 						enabled: !!smokeWebcamSourcePath,
 						sourcePath: smokeWebcamSourcePath,
+						timeOffsetMs: DEFAULT_WEBCAM_TIME_OFFSET_MS,
 						shadow:
 							smokeExportConfig.webcamShadow === undefined
 								? prev.shadow
@@ -1828,6 +1945,8 @@ export default function VideoEditor() {
 						...prev,
 						enabled: Boolean(sessionResult.session?.webcamPath),
 						sourcePath: sessionResult.session?.webcamPath ?? null,
+						timeOffsetMs:
+							sessionResult.session?.timeOffsetMs ?? DEFAULT_WEBCAM_TIME_OFFSET_MS,
 					}));
 					return;
 				}
@@ -1845,6 +1964,7 @@ export default function VideoEditor() {
 						...prev,
 						enabled: false,
 						sourcePath: null,
+						timeOffsetMs: DEFAULT_WEBCAM_TIME_OFFSET_MS,
 					}));
 				} else {
 					setError("No video to load. Please record or select a video.");
@@ -1863,6 +1983,7 @@ export default function VideoEditor() {
 		initialEditorPreferences,
 		smokeExportConfig.enabled,
 		smokeExportConfig.inputPath,
+		smokeExportConfig.projectPath,
 		smokeExportConfig.webcamInputPath,
 		smokeExportConfig.webcamShadow,
 		smokeExportConfig.webcamSize,
@@ -2153,83 +2274,106 @@ export default function VideoEditor() {
 	}, []);
 
 	const saveProject = useCallback(
-		async (forceSaveAs: boolean) => {
-			if (!currentSourcePath) {
-				toast.error("No video loaded");
-				return false;
-			}
+		async (forceSaveAs: boolean, options?: SaveProjectOptions) => {
+			clearPendingProjectAutosave();
+			return queueProjectSave(async () => {
+				if (!currentSourcePath) {
+					if (!options?.silent) {
+						toast.error("No video loaded");
+					}
+					return false;
+				}
 
-			try {
-				const projectData =
-					currentProjectSnapshot?.videoPath === currentSourcePath
-						? currentProjectSnapshot
-						: createProjectData(
-								currentSourcePath,
-								currentPersistedEditorState,
-								lastSavedSnapshot?.projectId ?? null,
-							);
+				const shouldCaptureThumbnail = options?.captureThumbnail ?? true;
+				const shouldRefreshLibrary = options?.refreshLibraryAfterSave ?? true;
+				const shouldRemountPreview = options?.remountPreviewAfterSave ?? true;
 
-				const fileNameBase =
-					currentSourcePath
-						.split(/[\\/]/)
-						.pop()
-						?.replace(/\.[^.]+$/, "") || `project-${Date.now()}`;
-				let targetProjectPath = forceSaveAs ? undefined : (currentProjectPath ?? undefined);
+				try {
+					const projectData =
+						currentProjectSnapshot?.videoPath === currentSourcePath
+							? currentProjectSnapshot
+							: createProjectData(
+									currentSourcePath,
+									currentPersistedEditorState,
+									lastSavedSnapshot?.projectId ?? null,
+								);
 
-				if (!forceSaveAs && !targetProjectPath) {
-					const activeProjectResult = await window.electronAPI.loadCurrentProjectFile();
-					if (activeProjectResult.success && activeProjectResult.path) {
-						targetProjectPath = activeProjectResult.path;
-						setCurrentProjectPath(activeProjectResult.path);
+					const fileNameBase =
+						currentSourcePath
+							.split(/[\\/]/)
+							.pop()
+							?.replace(/\.[^.]+$/, "") || `project-${Date.now()}`;
+					let targetProjectPath = forceSaveAs ? undefined : (currentProjectPath ?? undefined);
+
+					if (!forceSaveAs && !targetProjectPath) {
+						const activeProjectResult = await window.electronAPI.loadCurrentProjectFile();
+						if (activeProjectResult.success && activeProjectResult.path) {
+							targetProjectPath = activeProjectResult.path;
+							setCurrentProjectPath(activeProjectResult.path);
+						}
+					}
+
+					const thumbnailDataUrl = shouldCaptureThumbnail
+						? await captureProjectThumbnail()
+						: undefined;
+
+					const result = await window.electronAPI.saveProjectFile(
+						projectData,
+						fileNameBase,
+						targetProjectPath,
+						thumbnailDataUrl,
+					);
+
+					if (result.canceled) {
+						if (!options?.silent) {
+							toast.info("Project save canceled");
+						}
+						return false;
+					}
+
+					if (!result.success) {
+						if (!options?.silent) {
+							toast.error(result.message || "Failed to save project");
+						}
+						return false;
+					}
+
+					if (result.path) {
+						setCurrentProjectPath(result.path);
+					}
+					setLastSavedSnapshot(
+						cloneStructured(
+							createProjectData(
+								projectData.videoPath,
+								projectData.editor,
+								result.projectId ?? projectData.projectId ?? null,
+							),
+						),
+					);
+					if (shouldRefreshLibrary) {
+						await refreshProjectLibrary();
+					}
+
+					if (!options?.silent) {
+						toast.success(`Project saved to ${result.path}`);
+					}
+					return true;
+				} finally {
+					if (shouldRemountPreview) {
+						remountPreview();
 					}
 				}
-
-				const thumbnailDataUrl = await captureProjectThumbnail();
-
-				const result = await window.electronAPI.saveProjectFile(
-					projectData,
-					fileNameBase,
-					targetProjectPath,
-					thumbnailDataUrl,
-				);
-
-				if (result.canceled) {
-					toast.info("Project save canceled");
-					return false;
-				}
-
-				if (!result.success) {
-					toast.error(result.message || "Failed to save project");
-					return false;
-				}
-
-				if (result.path) {
-					setCurrentProjectPath(result.path);
-				}
-				setLastSavedSnapshot(
-					cloneStructured(
-						createProjectData(
-							projectData.videoPath,
-							projectData.editor,
-							result.projectId ?? projectData.projectId ?? null,
-						),
-					),
-				);
-				await refreshProjectLibrary();
-
-				toast.success(`Project saved to ${result.path}`);
-				return true;
-			} finally {
-				remountPreview();
-			}
+			});
 		},
 		[
 			captureProjectThumbnail,
+			clearPendingProjectAutosave,
 			currentSourcePath,
 			currentProjectPath,
 			currentProjectSnapshot,
 			currentPersistedEditorState,
 			lastSavedSnapshot?.projectId,
+			queueProjectSave,
 			refreshProjectLibrary,
 			remountPreview,
 		],
@@ -2257,6 +2401,27 @@ export default function VideoEditor() {
 			setProjectBrowserOpen(false);
 		}
 	}, [saveProject]);
+
+	useEffect(() => {
+		if (!currentProjectPath || !hasUnsavedChanges) {
+			clearPendingProjectAutosave();
+			return;
+		}
+
+		projectAutosaveTimeoutRef.current = window.setTimeout(() => {
+			projectAutosaveTimeoutRef.current = null;
+			void saveProject(false, {
+				silent: true,
+				remountPreviewAfterSave: false,
+				refreshLibraryAfterSave: false,
+				captureThumbnail: false,
+			});
+		}, PROJECT_AUTOSAVE_DELAY_MS);
+
+		return () => {
+			clearPendingProjectAutosave();
+		};
+	}, [clearPendingProjectAutosave, currentProjectPath, hasUnsavedChanges, saveProject]);
 
 	/**
 	 * Saves the current project directly into the projects library under a chosen name.
@@ -2429,6 +2594,7 @@ export default function VideoEditor() {
 			if (!videoPath || !videoSourcePath) {
 				if (mounted) {
 					setCursorTelemetry([]);
+					setCursorTelemetrySourcePath(null);
 				}
 				return;
 			}
@@ -2438,6 +2604,7 @@ export default function VideoEditor() {
 				if (mounted) {
 					const samples = result.success ? result.samples : [];
 					setCursorTelemetry(samples);
+					setCursorTelemetrySourcePath(videoSourcePath);
 
 					const shouldRetryFreshRecordingTelemetry =
 						pendingFreshRecordingAutoZoomPathRef.current === videoPath &&
@@ -2458,6 +2625,7 @@ export default function VideoEditor() {
 				console.warn("Unable to load cursor telemetry:", telemetryError);
 				if (mounted) {
 					setCursorTelemetry([]);
+					setCursorTelemetrySourcePath(videoSourcePath);
 					if (
 						pendingFreshRecordingAutoZoomPathRef.current === videoPath &&
 						autoSuggestedVideoPathRef.current !== videoPath &&
@@ -3170,6 +3338,23 @@ export default function VideoEditor() {
 		);
 	}, []);
 
+	const handleAudioVolumeChange = useCallback((volume: number) => {
+		if (!selectedAudioId) {
+			return;
+		}
+
+		if (!Number.isFinite(volume)) {
+			return;
+		}
+
+		const nextVolume = Math.max(0, Math.min(1, volume));
+		setAudioRegions((prev) =>
+			prev.map((region) =>
+				region.id === selectedAudioId ? { ...region, volume: nextVolume } : region,
+			),
+		);
+	}, [selectedAudioId]);
+
 	const handleAudioDelete = useCallback(
 		(id: string) => {
 			setAudioRegions((prev) => prev.filter((region) => region.id !== id));
@@ -3522,14 +3707,14 @@ export default function VideoEditor() {
 			}
 		}
 
-			for (const audioPath of previewSourceAudioFallbackPaths) {
-				let audio = existing.get(audioPath);
-				if (!audio) {
-					audio = new Audio();
-					audio.preload = "auto";
-					existing.set(audioPath, audio);
-				}
-				audio.dataset.sourceAudioPath = audioPath;
+		for (const audioPath of previewSourceAudioFallbackPaths) {
+			let audio = existing.get(audioPath);
+			if (!audio) {
+				audio = new Audio();
+				audio.preload = "auto";
+				existing.set(audioPath, audio);
+			}
+			audio.dataset.sourceAudioPath = audioPath;
 
 			if (sourceAudioElementResourcesRef.current.get(audioPath) !== audioPath) {
 				audio.pause();
@@ -3925,13 +4110,17 @@ export default function VideoEditor() {
 					}
 				} else {
 					// MP4 Export
-					const quality = settings.quality ?? exportQuality;
+					const quality = smokeExportConfig.enabled
+						? (smokeExportConfig.quality ?? settings.quality ?? exportQuality)
+						: (settings.quality ?? exportQuality);
 					const encodingMode = smokeExportConfig.enabled
 						? (smokeExportConfig.encodingMode ??
 							settings.encodingMode ??
 							exportEncodingMode)
 						: (settings.encodingMode ?? exportEncodingMode);
-					const selectedMp4FrameRate = settings.mp4FrameRate ?? mp4FrameRate;
+					const selectedMp4FrameRate = smokeExportConfig.enabled
+						? (smokeExportConfig.fps ?? settings.mp4FrameRate ?? mp4FrameRate)
+						: (settings.mp4FrameRate ?? mp4FrameRate);
 					const pipelineModel = smokeExportConfig.enabled
 						? (smokeExportConfig.pipelineModel ??
 							(smokeExportConfig.useNativeExport ? "modern" : "legacy"))
@@ -4057,19 +4246,51 @@ export default function VideoEditor() {
 							? Math.round(performance.now() - smokeExportStartedAt)
 							: undefined;
 
-					if (result.success && result.blob) {
-						const arrayBuffer = await result.blob.arrayBuffer();
+					if (result.success && (result.blob || result.tempFilePath)) {
 						const timestamp = Date.now();
 						const fileName = `export-${timestamp}.mp4`;
 						markExportAsSaving();
 
-						const saveResult =
-							smokeExportConfig.enabled && smokeExportConfig.outputPath
-								? await window.electronAPI.writeExportedVideoToPath(
-										arrayBuffer,
-										smokeExportConfig.outputPath,
-									)
-								: await window.electronAPI.saveExportedVideo(arrayBuffer, fileName);
+						let saveResult: {
+							success: boolean;
+							path?: string;
+							message?: string;
+							canceled?: boolean;
+						};
+						let pendingOnCancel: PendingExportSave;
+
+						if (result.tempFilePath) {
+							// Preferred path: main process already holds the finished MP4 on
+							// disk, so we just ask it to move the temp file into place. This
+							// avoids ever allocating a multi-GiB ArrayBuffer in the renderer.
+							saveResult = await window.electronAPI.finalizeExportedVideo({
+								tempPath: result.tempFilePath,
+								fileName,
+								outputPath:
+									smokeExportConfig.enabled && smokeExportConfig.outputPath
+										? smokeExportConfig.outputPath
+										: null,
+							});
+							pendingOnCancel = { fileName, tempFilePath: result.tempFilePath };
+						} else if (result.blob) {
+							// Legacy fallback: small exports may still surface a Blob (GIF,
+							// smoke tests in non-Electron environments, etc.).
+							const arrayBuffer = await result.blob.arrayBuffer();
+							saveResult =
+								smokeExportConfig.enabled && smokeExportConfig.outputPath
+									? await window.electronAPI.writeExportedVideoToPath(
+											arrayBuffer,
+											smokeExportConfig.outputPath,
+										)
+									: await window.electronAPI.saveExportedVideo(
+											arrayBuffer,
+											fileName,
+										);
+							pendingOnCancel = { fileName, arrayBuffer };
+						} else {
+							saveResult = { success: false, message: "Export produced no output" };
+							pendingOnCancel = { fileName };
+						}
 
 						if (saveResult.canceled) {
 							if (smokeExportConfig.enabled) {
@@ -4087,7 +4308,7 @@ export default function VideoEditor() {
 									metrics: result.metrics,
 								});
 							}
-							pendingExportSaveRef.current = { arrayBuffer, fileName };
+							pendingExportSaveRef.current = pendingOnCancel;
 							setHasPendingExportSave(true);
 							setExportError(
 								"Save dialog canceled. Click Save Again to save without re-rendering.",
@@ -4139,6 +4360,15 @@ export default function VideoEditor() {
 							}
 							setExportError(saveResult.message || "Failed to save video");
 							toast.error(saveResult.message || "Failed to save video");
+							// Keep the pending-save entry so the user can retry without
+							// re-rendering. The temp file is still on disk (the main
+							// process only moves/deletes it on success) and the
+							// ArrayBuffer fallback still references its in-memory blob.
+							if (pendingOnCancel.tempFilePath || pendingOnCancel.arrayBuffer) {
+								pendingExportSaveRef.current = pendingOnCancel;
+								setHasPendingExportSave(true);
+								keepExportDialogOpen = true;
+							}
 							if (smokeExportConfig.enabled) {
 								window.close();
 								return;
@@ -4240,6 +4470,7 @@ export default function VideoEditor() {
 			padding,
 			cropRegion,
 			webcam,
+			resolvedWebcamVideoUrl,
 			annotationRegions,
 			autoCaptions,
 			autoCaptionSettings,
@@ -4263,6 +4494,8 @@ export default function VideoEditor() {
 			effectiveSpeedRegions,
 			frame,
 			smokeExportConfig.encodingMode,
+			smokeExportConfig.fps,
+			smokeExportConfig.quality,
 		],
 	);
 
@@ -4282,6 +4515,18 @@ export default function VideoEditor() {
 			return;
 		}
 
+		// When smoke-export opens a .recordly project, the cursor telemetry
+		// sidecar is loaded asynchronously after the editor state applies.
+		// Without this gate the auto-export fires before telemetry arrives and
+		// produces a video with no cursor/zoom animations.
+		if (
+			smokeExportConfig.projectPath &&
+			videoSourcePath &&
+			cursorTelemetrySourcePath !== videoSourcePath
+		) {
+			return;
+		}
+
 		smokeExportStartedRef.current = true;
 		void handleExport({
 			format: "mp4",
@@ -4289,12 +4534,15 @@ export default function VideoEditor() {
 			encodingMode: smokeExportConfig.encodingMode ?? "balanced",
 		});
 	}, [
+		cursorTelemetrySourcePath,
 		error,
 		handleExport,
 		loading,
 		smokeExportConfig.enabled,
 		smokeExportConfig.encodingMode,
+		smokeExportConfig.projectPath,
 		videoPath,
+		videoSourcePath,
 	]);
 
 	const handleOpenExportDropdown = useCallback(() => {
@@ -4397,10 +4645,27 @@ export default function VideoEditor() {
 			return;
 		}
 
-		const saveResult = await window.electronAPI.saveExportedVideo(
-			pendingSave.arrayBuffer,
-			pendingSave.fileName,
-		);
+		let saveResult: {
+			success: boolean;
+			path?: string;
+			message?: string;
+			canceled?: boolean;
+		};
+
+		if (pendingSave.tempFilePath) {
+			saveResult = await window.electronAPI.finalizeExportedVideo({
+				tempPath: pendingSave.tempFilePath,
+				fileName: pendingSave.fileName,
+				outputPath: null,
+			});
+		} else if (pendingSave.arrayBuffer) {
+			saveResult = await window.electronAPI.saveExportedVideo(
+				pendingSave.arrayBuffer,
+				pendingSave.fileName,
+			);
+		} else {
+			saveResult = { success: false, message: "No pending export to save" };
+		}
 
 		if (saveResult.canceled) {
 			setExportError("Save dialog canceled. Click Save Again to save without re-rendering.");
@@ -4409,7 +4674,11 @@ export default function VideoEditor() {
 		}
 
 		if (saveResult.success && saveResult.path) {
-			clearPendingExportSave();
+			// finalizeExportedVideo already moved the temp file into place, so the
+			// pending-save entry no longer refers to a file on disk. Flip the flag
+			// directly to avoid clearPendingExportSave issuing a spurious discard.
+			pendingExportSaveRef.current = null;
+			setHasPendingExportSave(false);
 			setExportError(null);
 			setExportedFilePath(saveResult.path);
 			showExportSuccessToast(saveResult.path);
@@ -4420,7 +4689,7 @@ export default function VideoEditor() {
 		const errorMessage = saveResult.message || "Failed to save video";
 		setExportError(errorMessage);
 		toast.error(errorMessage);
-	}, [clearPendingExportSave, showExportSuccessToast]);
+	}, [showExportSuccessToast]);
 
 	const handleOpenCropEditor = useCallback(() => {
 		cropSnapshotRef.current = { ...cropRegion };
@@ -5019,6 +5288,15 @@ export default function VideoEditor() {
 									selectedClipId && handleClipMutedChange(muted)
 								}
 								onClipDelete={handleClipDelete}
+								selectedAudioId={selectedAudioId}
+								selectedAudioVolume={
+									selectedAudioId
+										? (audioRegions.find((r) => r.id === selectedAudioId)
+												?.volume ?? null)
+										: null
+								}
+								onAudioVolumeChange={handleAudioVolumeChange}
+								onAudioDelete={handleAudioDelete}
 								shadowIntensity={shadowIntensity}
 								onShadowChange={setShadowIntensity}
 								backgroundBlur={backgroundBlur}
@@ -5322,7 +5600,8 @@ export default function VideoEditor() {
 													audioRegions.length > 0
 														? Math.max(
 																...audioRegions.map(
-																	(region) => region.trackIndex ?? 0,
+																	(region) =>
+																		region.trackIndex ?? 0,
 																),
 															) + 1
 														: 0;
