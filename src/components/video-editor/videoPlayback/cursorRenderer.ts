@@ -16,11 +16,12 @@ import {
 	getCursorSpringConfig,
 	resetSpringState,
 	stepSpringValue,
+	type CursorSpringTuning,
 } from "./motionSmoothing";
-import { UPLOADED_CURSOR_SAMPLE_SIZE, uploadedCursorAssets } from "./uploadedCursorAssets";
+import { cursorSetAssets, getCursorStyleSizeMultiplier } from "./uploadedCursorAssets";
 
 type CursorAssetKey = NonNullable<CursorTelemetryPoint["cursorType"]>;
-type StatefulCursorStyle = Extract<CursorStyle, "tahoe" | "mono">;
+type StatefulCursorStyle = Extract<CursorStyle, "macos" | "tahoe" | "tahoe-inverted">;
 type SingleCursorStyle = Extract<CursorStyle, "dot" | "figma">;
 type CursorPackStyle = Exclude<CursorStyle, StatefulCursorStyle | SingleCursorStyle>;
 type CursorPackVariant = "default" | "pointer";
@@ -56,6 +57,8 @@ export interface CursorRenderConfig {
 	trailLength: number;
 	/** Smoothing factor for cursor interpolation (0–1, lower = smoother/slower) */
 	smoothingFactor: number;
+	/** Optional multipliers applied on top of the derived cursor spring config. */
+	springTuning: CursorSpringTuning;
 	/** Directional cursor motion blur amount. */
 	motionBlur: number;
 	/** Click bounce multiplier. */
@@ -74,6 +77,11 @@ export const DEFAULT_CURSOR_CONFIG: CursorRenderConfig = {
 	dotAlpha: 0.95,
 	trailLength: 0,
 	smoothingFactor: 0.18,
+	springTuning: {
+		stiffnessMultiplier: 1,
+		dampingMultiplier: 1,
+		massMultiplier: 1,
+	},
 	motionBlur: 0,
 	clickBounce: 1,
 	clickBounceDuration: DEFAULT_CURSOR_CLICK_BOUNCE_DURATION,
@@ -95,12 +103,13 @@ const CURSOR_SHADOW_OFFSET_X = 0;
 const CURSOR_SHADOW_OFFSET_Y = 2;
 const CURSOR_SHADOW_BLUR = 3;
 const CURSOR_SHADOW_PADDING = 12;
-
 let cursorAssetsPromise: Promise<void> | null = null;
 let cursorPackAssetsPromise: Promise<void> | null = null;
 let loadedCursorPackSourcesSignature = "";
 let loadedCursorAssets: Partial<Record<CursorAssetKey, LoadedCursorAsset>> = {};
-let loadedInvertedCursorAssets: Partial<Record<CursorAssetKey, LoadedCursorAsset>> = {};
+let loadedCursorSetAssets: Partial<
+	Record<StatefulCursorStyle, Partial<Record<CursorAssetKey, LoadedCursorAsset>>>
+> = {};
 let loadedCursorStyleAssets: Partial<Record<SingleCursorStyle, LoadedCursorAsset>> = {};
 let loadedCursorPackAssets: Partial<Record<string, LoadedCursorPackAssets>> = {};
 const warnedMissingCursorPackStyles = new Set<string>();
@@ -147,7 +156,7 @@ function buildCursorPackSourcesSignature(sources: Record<string, CursorPackSourc
 }
 
 function isStatefulCursorStyle(style: CursorStyle): style is StatefulCursorStyle {
-	return style === "tahoe" || style === "mono";
+	return style === "macos" || style === "tahoe" || style === "tahoe-inverted";
 }
 
 function isSingleCursorStyle(style: CursorStyle): style is SingleCursorStyle {
@@ -347,57 +356,6 @@ async function createInvertedCursorAsset(asset: LoadedCursorAsset): Promise<Load
 	};
 }
 
-function getNormalizedAnchor(
-	systemAsset: SystemCursorAsset | undefined,
-	fallbackAnchor: { x: number; y: number },
-) {
-	if (!systemAsset || systemAsset.width <= 0 || systemAsset.height <= 0) {
-		return fallbackAnchor;
-	}
-
-	return {
-		x: clamp(systemAsset.hotspotX / systemAsset.width, 0, 1),
-		y: clamp(systemAsset.hotspotY / systemAsset.height, 0, 1),
-	};
-}
-
-/**
- * Loads an SVG at `sampleSize × sampleSize`, crops the trim region out of it,
- * and returns a PNG data-URL of the cropped result. This is required because
- * SVG files have their own natural pixel size (e.g. 32×32) which does not
- * match the 1024-sample coordinate space used by the trim measurements.
- */
-async function rasterizeAndCropSvg(
-	url: string,
-	sampleSize: number,
-	trimX: number,
-	trimY: number,
-	trimWidth: number,
-	trimHeight: number,
-): Promise<{ dataUrl: string; width: number; height: number }> {
-	const img = await loadImage(url);
-
-	// Draw at full sample size
-	const srcCanvas = document.createElement("canvas");
-	srcCanvas.width = sampleSize;
-	srcCanvas.height = sampleSize;
-	const srcCtx = srcCanvas.getContext("2d")!;
-	srcCtx.drawImage(img, 0, 0, sampleSize, sampleSize);
-
-	// Crop to trim bounds
-	const dstCanvas = document.createElement("canvas");
-	dstCanvas.width = trimWidth;
-	dstCanvas.height = trimHeight;
-	const dstCtx = dstCanvas.getContext("2d")!;
-	dstCtx.drawImage(srcCanvas, trimX, trimY, trimWidth, trimHeight, 0, 0, trimWidth, trimHeight);
-
-	return {
-		dataUrl: dstCanvas.toDataURL("image/png"),
-		width: dstCanvas.width,
-		height: dstCanvas.height,
-	};
-}
-
 function getCursorAsset(key: CursorAssetKey): LoadedCursorAsset {
 	const asset = loadedCursorAssets[key];
 	if (!asset) {
@@ -438,7 +396,7 @@ function getCursorPackStyleAsset(style: CursorPackStyle, key: CursorAssetKey) {
 }
 
 function getStatefulCursorAsset(style: StatefulCursorStyle, key: CursorAssetKey) {
-	const assetMap = style === "mono" ? loadedInvertedCursorAssets : loadedCursorAssets;
+	const assetMap = loadedCursorSetAssets[style] ?? loadedCursorAssets;
 	const asset = assetMap[key] ?? assetMap.arrow;
 	if (!asset) {
 		throw new Error(`Missing ${style} cursor asset for ${key}`);
@@ -485,112 +443,69 @@ async function ensureCursorPackAssetsLoaded() {
 export async function preloadCursorAssets() {
 	if (!cursorAssetsPromise) {
 		cursorAssetsPromise = (async () => {
-			const isLinux = typeof navigator !== "undefined" && /linux/i.test(navigator.platform);
-			let systemCursors: Record<string, SystemCursorAsset> = {};
-
-			try {
-				const result = await window.electronAPI.getSystemCursorAssets();
-				if (result.success && result.cursors) {
-					systemCursors = result.cursors;
-				}
-			} catch (error) {
-				console.warn("[CursorRenderer] Failed to fetch system cursor assets:", error);
-			}
-
-			const entries = await Promise.all(
-				SUPPORTED_CURSOR_KEYS.map(async (key) => {
-					const systemAsset = systemCursors[key];
-					const uploadedAsset = uploadedCursorAssets[key];
-					const assetUrl = isLinux
-						? uploadedAsset?.url
-						: (uploadedAsset?.url ?? systemAsset?.dataUrl);
-
-					if (!assetUrl) {
-						console.warn(`[CursorRenderer] No cursor image for: ${key}`);
-						return null;
-					}
-
-					try {
-						let finalUrl: string;
-						let width: number;
-						let height: number;
-						let normalizedAnchor: { x: number; y: number };
-
-						if (uploadedAsset) {
-							const { trim } = uploadedAsset;
-							const rasterized = await rasterizeAndCropSvg(
-								assetUrl,
-								UPLOADED_CURSOR_SAMPLE_SIZE,
-								trim.x,
-								trim.y,
-								trim.width,
-								trim.height,
-							);
-							finalUrl = rasterized.dataUrl;
-							width = rasterized.width;
-							height = rasterized.height;
-							normalizedAnchor = {
-								x: clamp(
-									(uploadedAsset.fallbackAnchor.x * trim.width) / width,
-									0,
-									1,
-								),
-								y: clamp(
-									(uploadedAsset.fallbackAnchor.y * trim.height) / height,
-									0,
-									1,
-								),
-							};
-						} else {
-							finalUrl = assetUrl;
-							const img = await loadImage(finalUrl);
-							width = img.naturalWidth;
-							height = img.naturalHeight;
-							normalizedAnchor = getNormalizedAnchor(systemAsset, {
-								x: 0,
-								y: 0,
-							});
+			async function loadCursorSet(
+				style: keyof typeof cursorSetAssets,
+			): Promise<Partial<Record<CursorAssetKey, LoadedCursorAsset>>> {
+				const entries = await Promise.all(
+					SUPPORTED_CURSOR_KEYS.map(async (key) => {
+						const sourceAsset = cursorSetAssets[style][key];
+						if (!sourceAsset?.url) {
+							console.warn(`[CursorRenderer] No cursor image for: ${style}/${key}`);
+							return null;
 						}
 
-						await Assets.load(finalUrl);
-						const image = await loadImage(finalUrl);
-						const texture = Texture.from(finalUrl);
+						try {
+							await Assets.load(sourceAsset.url);
+							const image = await loadImage(sourceAsset.url);
+							const texture = Texture.from(sourceAsset.url);
 
-						return [
-							key,
-							{
-								texture,
-								image,
-								aspectRatio: height > 0 ? width / height : 1,
-								anchorX: normalizedAnchor.x,
-								anchorY: normalizedAnchor.y,
-							} satisfies LoadedCursorAsset,
-						] as const;
-					} catch (error) {
-						console.warn(
-							`[CursorRenderer] Failed to load cursor image for: ${key}`,
-							error,
-						);
-						return null;
-					}
-				}),
-			);
+							return [
+								key,
+								{
+									texture,
+									image,
+									aspectRatio:
+										image.naturalHeight > 0
+											? image.naturalWidth / image.naturalHeight
+											: 1,
+									anchorX: clamp(sourceAsset.fallbackAnchor.x, 0, 1),
+									anchorY: clamp(sourceAsset.fallbackAnchor.y, 0, 1),
+								} satisfies LoadedCursorAsset,
+							] as const;
+						} catch (error) {
+							console.warn(
+								`[CursorRenderer] Failed to load cursor image for: ${style}/${key}`,
+								error,
+							);
+							return null;
+						}
+					}),
+				);
 
-			loadedCursorAssets = Object.fromEntries(
-				entries.filter(Boolean).map((entry) => entry!),
-			) as Partial<Record<CursorAssetKey, LoadedCursorAsset>>;
+				return Object.fromEntries(
+					entries.filter(Boolean).map((entry) => entry!),
+				) as Partial<Record<CursorAssetKey, LoadedCursorAsset>>;
+			}
+
+			const [macosAssets, tahoeAssets] = await Promise.all([
+				loadCursorSet("macos"),
+				loadCursorSet("tahoe"),
+			]);
 
 			const invertedEntries = await Promise.all(
-				(
-					Object.entries(loadedCursorAssets) as Array<[CursorAssetKey, LoadedCursorAsset]>
-				).map(
+				(Object.entries(tahoeAssets) as Array<[CursorAssetKey, LoadedCursorAsset]>).map(
 					async ([key, asset]) => [key, await createInvertedCursorAsset(asset)] as const,
 				),
 			);
 
-			loadedInvertedCursorAssets = Object.fromEntries(invertedEntries) as Partial<
-				Record<CursorAssetKey, LoadedCursorAsset>
-			>;
+			loadedCursorSetAssets = {
+				macos: macosAssets,
+				tahoe: tahoeAssets,
+				"tahoe-inverted": Object.fromEntries(invertedEntries) as Partial<
+					Record<CursorAssetKey, LoadedCursorAsset>
+				>,
+			};
+			loadedCursorAssets = tahoeAssets;
 
 			const customStyleEntries = await Promise.all(
 				(["dot", "figma"] as const).map(
@@ -737,7 +652,10 @@ function getCursorViewportScale(viewport: CursorViewportRect) {
 	return Math.max(MIN_CURSOR_VIEWPORT_SCALE, viewport.width / REFERENCE_WIDTH);
 }
 
-function getCursorSwaySpringConfig(smoothingFactor: number) {
+function getCursorSwaySpringConfig(
+	smoothingFactor: number,
+	springTuning: CursorSpringTuning,
+) {
 	const baseConfig = getCursorSpringConfig(
 		Math.min(
 			2,
@@ -746,6 +664,7 @@ function getCursorSwaySpringConfig(smoothingFactor: number) {
 				smoothingFactor * CURSOR_SWAY_SMOOTHING_MULTIPLIER + CURSOR_SWAY_SMOOTHING_OFFSET,
 			),
 		),
+		springTuning,
 	);
 
 	return {
@@ -793,14 +712,16 @@ export class SmoothedCursorState {
 	public y = 0.5;
 	public trail: Array<{ x: number; y: number }> = [];
 	private smoothingFactor: number;
+	private springTuning: CursorSpringTuning;
 	private trailLength: number;
 	private initialized = false;
 	private lastTimeMs: number | null = null;
 	private xSpring = createSpringState(0.5);
 	private ySpring = createSpringState(0.5);
 
-	constructor(config: Pick<CursorRenderConfig, "smoothingFactor" | "trailLength">) {
+	constructor(config: Pick<CursorRenderConfig, "smoothingFactor" | "trailLength" | "springTuning">) {
 		this.smoothingFactor = config.smoothingFactor;
+		this.springTuning = config.springTuning;
 		this.trailLength = config.trailLength;
 	}
 
@@ -834,13 +755,17 @@ export class SmoothedCursorState {
 			this.lastTimeMs === null ? 1000 / 60 : Math.max(1, timeMs - this.lastTimeMs);
 		this.lastTimeMs = timeMs;
 
-		const springConfig = getCursorSpringConfig(this.smoothingFactor);
+		const springConfig = getCursorSpringConfig(this.smoothingFactor, this.springTuning);
 		this.x = stepSpringValue(this.xSpring, targetX, deltaMs, springConfig);
 		this.y = stepSpringValue(this.ySpring, targetY, deltaMs, springConfig);
 	}
 
 	setSmoothingFactor(smoothingFactor: number): void {
 		this.smoothingFactor = smoothingFactor;
+	}
+
+	setSpringTuning(springTuning: CursorSpringTuning): void {
+		this.springTuning = springTuning;
 	}
 
 	snapTo(targetX: number, targetY: number, timeMs: number): void {
@@ -884,7 +809,14 @@ export class PixiCursorOverlay {
 	private swaySpring = createSpringState(0);
 
 	constructor(config: Partial<CursorRenderConfig> = {}) {
-		this.config = { ...DEFAULT_CURSOR_CONFIG, ...config };
+		this.config = {
+			...DEFAULT_CURSOR_CONFIG,
+			...config,
+			springTuning: {
+				...DEFAULT_CURSOR_CONFIG.springTuning,
+				...config.springTuning,
+			},
+		};
 		this.state = new SmoothedCursorState(this.config);
 
 		this.container = new Container();
@@ -954,6 +886,14 @@ export class PixiCursorOverlay {
 	setSmoothingFactor(smoothingFactor: number) {
 		this.config.smoothingFactor = smoothingFactor;
 		this.state.setSmoothingFactor(smoothingFactor);
+	}
+
+	setSpringTuning(springTuning: CursorSpringTuning) {
+		this.config.springTuning = {
+			...DEFAULT_CURSOR_CONFIG.springTuning,
+			...springTuning,
+		};
+		this.state.setSpringTuning(this.config.springTuning);
 	}
 
 	setMotionBlur(motionBlur: number) {
@@ -1084,7 +1024,7 @@ export class PixiCursorOverlay {
 			0.72,
 			1 - Math.sin(clickBounceProgress * Math.PI) * (0.08 * this.config.clickBounce),
 		);
-		const scaledH = h;
+		const scaledH = h * getCursorStyleSizeMultiplier(this.config.style);
 		const swayRotation = this.updateCursorSway(px, py, timeMs, shouldFreezeCursorMotion);
 
 		this.clickRingGraphics.clear();
@@ -1188,7 +1128,7 @@ export class PixiCursorOverlay {
 			this.swaySpring,
 			targetRotation,
 			deltaMs,
-			getCursorSwaySpringConfig(this.config.smoothingFactor),
+			getCursorSwaySpringConfig(this.config.smoothingFactor, this.config.springTuning),
 		);
 
 		if (Math.abs(this.swayRotation) < 0.0001 && targetRotation === 0) {
@@ -1307,7 +1247,7 @@ export function drawCursorOnCanvas(
 		ctx.filter = CURSOR_SVG_DROP_SHADOW_FILTER;
 	}
 
-	const drawHeight = h * bounceScale;
+	const drawHeight = h * bounceScale * getCursorStyleSizeMultiplier(config.style);
 	const drawWidth = drawHeight * asset.aspectRatio;
 	const hotspotX = asset.anchorX * drawWidth;
 	const hotspotY = asset.anchorY * drawHeight;

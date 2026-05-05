@@ -9,6 +9,8 @@ import type { CursorVisualType, CursorInteractionType, CursorTelemetryPoint } fr
 import {
 	cursorCaptureInterval,
 	setCursorCaptureInterval,
+	cursorCaptureAccumulatedPausedMs,
+	cursorCapturePauseStartedAtMs,
 	cursorCaptureStartTimeMs,
 	activeCursorSamples,
 	pendingCursorSamples,
@@ -18,10 +20,85 @@ import {
 	linuxCursorScreenPoint,
 	selectedSource,
 	selectedWindowBounds,
+	setCursorCaptureAccumulatedPausedMs,
+	setCursorCapturePauseStartedAtMs,
 } from "../state";
 
 export function clamp(value: number, min: number, max: number) {
 	return Math.min(max, Math.max(min, value));
+}
+
+export function normalizeCursorTelemetrySamples(rawSamples: unknown): CursorTelemetryPoint[] {
+	const samples = Array.isArray(rawSamples)
+		? rawSamples
+		: Array.isArray((rawSamples as { samples?: unknown[] } | null | undefined)?.samples)
+			? ((rawSamples as { samples: unknown[] }).samples ?? [])
+			: [];
+	const boundedSamples = samples.slice(0, MAX_CURSOR_SAMPLES);
+
+	return boundedSamples
+		.filter((sample: unknown) => Boolean(sample && typeof sample === "object"))
+		.map((sample: unknown) => {
+			const point = sample as Partial<CursorTelemetryPoint>;
+			return {
+				timeMs:
+					typeof point.timeMs === "number" && Number.isFinite(point.timeMs)
+						? Math.max(0, point.timeMs)
+						: 0,
+				cx:
+					typeof point.cx === "number" && Number.isFinite(point.cx)
+						? clamp(point.cx, 0, 1)
+						: 0.5,
+				cy:
+					typeof point.cy === "number" && Number.isFinite(point.cy)
+						? clamp(point.cy, 0, 1)
+						: 0.5,
+				interactionType:
+					point.interactionType === "click" ||
+					point.interactionType === "double-click" ||
+					point.interactionType === "right-click" ||
+					point.interactionType === "middle-click" ||
+					point.interactionType === "move" ||
+					point.interactionType === "mouseup"
+						? point.interactionType
+						: undefined,
+				cursorType:
+					point.cursorType === "arrow" ||
+					point.cursorType === "text" ||
+					point.cursorType === "pointer" ||
+					point.cursorType === "crosshair" ||
+					point.cursorType === "open-hand" ||
+					point.cursorType === "closed-hand" ||
+					point.cursorType === "resize-ew" ||
+					point.cursorType === "resize-ns" ||
+					point.cursorType === "not-allowed"
+						? point.cursorType
+						: undefined,
+			};
+		})
+		.sort((a, b) => a.timeMs - b.timeMs);
+}
+
+export async function writeCursorTelemetry(videoPath: string, samples: unknown) {
+	const telemetryPath = getTelemetryPathForVideo(videoPath);
+	const normalizedSamples = normalizeCursorTelemetrySamples(samples);
+
+	if (normalizedSamples.length === 0) {
+		await fs.rm(telemetryPath, { force: true });
+		return normalizedSamples;
+	}
+
+	await fs.writeFile(
+		telemetryPath,
+		JSON.stringify(
+			{ version: CURSOR_TELEMETRY_VERSION, samples: normalizedSamples },
+			null,
+			2,
+		),
+		"utf-8",
+	);
+
+	return normalizedSamples;
 }
 
 export function stopCursorCapture() {
@@ -29,6 +106,55 @@ export function stopCursorCapture() {
 		clearTimeout(cursorCaptureInterval);
 		setCursorCaptureInterval(null);
 	}
+}
+
+export function resetCursorCaptureClock() {
+	setCursorCaptureAccumulatedPausedMs(0);
+	setCursorCapturePauseStartedAtMs(null);
+}
+
+export function isCursorCapturePaused() {
+	return cursorCapturePauseStartedAtMs !== null;
+}
+
+export function pauseCursorCapture(pausedAtMs: number) {
+	if (cursorCapturePauseStartedAtMs !== null) {
+		return;
+	}
+
+	setCursorCapturePauseStartedAtMs(pausedAtMs);
+}
+
+export function resumeCursorCapture(resumedAtMs: number) {
+	if (cursorCapturePauseStartedAtMs === null) {
+		return;
+	}
+
+	const pauseDurationMs = Math.max(0, resumedAtMs - cursorCapturePauseStartedAtMs);
+	setCursorCaptureAccumulatedPausedMs(
+		cursorCaptureAccumulatedPausedMs + pauseDurationMs,
+	);
+	setCursorCapturePauseStartedAtMs(null);
+}
+
+export function getCursorCaptureElapsedMs(nowMs = Date.now()) {
+	if (!Number.isFinite(cursorCaptureStartTimeMs) || cursorCaptureStartTimeMs <= 0) {
+		return 0;
+	}
+
+	const safeNowMs = Math.max(cursorCaptureStartTimeMs, nowMs);
+	const activePauseDurationMs =
+		cursorCapturePauseStartedAtMs === null
+			? 0
+			: Math.max(0, safeNowMs - cursorCapturePauseStartedAtMs);
+
+	return Math.max(
+		0,
+		safeNowMs -
+			cursorCaptureStartTimeMs -
+			Math.max(0, cursorCaptureAccumulatedPausedMs) -
+			activePauseDurationMs,
+	);
 }
 
 export function getNormalizedCursorPoint() {
@@ -117,7 +243,7 @@ export function pushCursorSample(
 
 export function sampleCursorPoint() {
 	const point = getNormalizedCursorPoint();
-	pushCursorSample(point.cx, point.cy, Date.now() - cursorCaptureStartTimeMs, "move");
+	pushCursorSample(point.cx, point.cy, getCursorCaptureElapsedMs(), "move");
 }
 
 export async function persistPendingCursorTelemetry(videoPath: string) {
@@ -163,7 +289,7 @@ export function startCursorSampling() {
 	let nextExpectedMs = Date.now() + CURSOR_SAMPLE_INTERVAL_MS;
 
 	const tick = () => {
-		if (isCursorCaptureActive) {
+		if (isCursorCaptureActive && !isCursorCapturePaused()) {
 			sampleCursorPoint();
 		}
 

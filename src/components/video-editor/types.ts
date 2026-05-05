@@ -50,8 +50,8 @@ export interface CursorVisualSettings {
 	style: CursorStyle;
 }
 
-export type CursorStyle = "tahoe" | "dot" | "figma" | "mono" | (string & {}); // extension-contributed cursor styles
-export const DEFAULT_CURSOR_STYLE: CursorStyle = "tahoe";
+export type CursorStyle = "macos" | "tahoe" | "tahoe-inverted" | "dot" | "figma" | (string & {}); // extension-contributed cursor styles
+export const DEFAULT_CURSOR_STYLE: CursorStyle = "macos";
 
 export type EditorEffectSection =
 	| "scene"
@@ -100,6 +100,7 @@ export const DEFAULT_CURSOR_MOTION_BLUR = 0.4;
 export const DEFAULT_CURSOR_CLICK_BOUNCE = 2.5;
 export const DEFAULT_CURSOR_CLICK_BOUNCE_DURATION = 350;
 export const DEFAULT_CURSOR_SWAY = 0.25;
+export const DEFAULT_ZOOM_SMOOTHNESS = 0.5;
 export const DEFAULT_ZOOM_MOTION_BLUR = 0.35;
 export const DEFAULT_ZOOM_IN_DURATION_MS = 1522.575;
 export const DEFAULT_ZOOM_IN_OVERLAP_MS = 500;
@@ -153,6 +154,92 @@ export function getClipSourceEndMs(clip: ClipRegion): number {
 	const displayDurationMs = Math.max(0, clip.endMs - clip.startMs);
 	const speed = Number.isFinite(clip.speed) && clip.speed > 0 ? clip.speed : 1;
 	return Math.round(clip.startMs + displayDurationMs * speed);
+}
+
+export function sortClipRegions(clips: ClipRegion[]): ClipRegion[] {
+	return [...clips].sort((left, right) => left.startMs - right.startMs);
+}
+
+function getSafeClipSpeed(clip: ClipRegion) {
+	return Number.isFinite(clip.speed) && clip.speed > 0 ? clip.speed : 1;
+}
+
+function clampToNearestClipBoundary(
+	timeMs: number,
+	clips: ClipRegion[],
+	kind: "timeline" | "source",
+) {
+	let nearestTimeMs = Math.round(timeMs);
+	let nearestDistance = Number.POSITIVE_INFINITY;
+
+	for (const clip of clips) {
+		const boundaries =
+			kind === "timeline"
+				? [clip.startMs, clip.endMs]
+				: [clip.startMs, getClipSourceEndMs(clip)];
+
+		for (const boundary of boundaries) {
+			const distance = Math.abs(timeMs - boundary);
+			if (distance < nearestDistance) {
+				nearestDistance = distance;
+				nearestTimeMs = Math.round(boundary);
+			}
+		}
+	}
+
+	return nearestTimeMs;
+}
+
+export function mapTimelineTimeToSourceTime(timeMs: number, clips: ClipRegion[]): number {
+	const roundedTimeMs = Math.round(timeMs);
+	const sortedClips = sortClipRegions(clips);
+
+	for (const clip of sortedClips) {
+		if (roundedTimeMs < clip.startMs || roundedTimeMs > clip.endMs) {
+			continue;
+		}
+
+		return Math.round(
+			clip.startMs + (roundedTimeMs - clip.startMs) * getSafeClipSpeed(clip),
+		);
+	}
+
+	if (sortedClips.length === 0) {
+		return roundedTimeMs;
+	}
+
+	return clampToNearestClipBoundary(roundedTimeMs, sortedClips, "timeline");
+}
+
+export function mapSourceTimeToTimelineTime(timeMs: number, clips: ClipRegion[]): number {
+	const roundedTimeMs = Math.round(timeMs);
+	const sortedClips = sortClipRegions(clips);
+
+	for (const clip of sortedClips) {
+		const sourceEndMs = getClipSourceEndMs(clip);
+		if (roundedTimeMs < clip.startMs || roundedTimeMs > sourceEndMs) {
+			continue;
+		}
+
+		return Math.round(
+			clip.startMs + (roundedTimeMs - clip.startMs) / getSafeClipSpeed(clip),
+		);
+	}
+
+	if (sortedClips.length === 0) {
+		return roundedTimeMs;
+	}
+
+	return clampToNearestClipBoundary(roundedTimeMs, sortedClips, "source");
+}
+
+export function findClipAtTimelineTime(timeMs: number, clips: ClipRegion[]): ClipRegion | null {
+	const roundedTimeMs = Math.round(timeMs);
+	return (
+		sortClipRegions(clips).find(
+			(clip) => roundedTimeMs >= clip.startMs && roundedTimeMs < clip.endMs,
+		) ?? null
+	);
 }
 
 export function extendAutoFullTrackClip(
@@ -266,19 +353,11 @@ export interface AnnotationTextStyle {
 }
 
 function getDefaultAnnotationFontFamily() {
-	if (typeof navigator !== "undefined" && /mac/i.test(navigator.platform)) {
-		return '"SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif';
-	}
-
-	return "Inter, system-ui, sans-serif";
+	return '"SF Pro Display", "SF Pro Text", Helvetica, sans-serif';
 }
 
 export function getDefaultCaptionFontFamily() {
-	if (typeof navigator !== "undefined" && /mac/i.test(navigator.platform)) {
-		return '"SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, sans-serif';
-	}
-
-	return '"Helvetica Neue", Helvetica, Arial, sans-serif';
+	return '"SF Pro Text", "SF Pro Display", Helvetica, sans-serif';
 }
 
 export interface AnnotationRegion {
@@ -350,10 +429,10 @@ export interface Padding {
 }
 
 export const DEFAULT_PADDING: Padding = {
-	top: 50,
-	bottom: 50,
-	left: 50,
-	right: 50,
+	top: 20,
+	bottom: 20,
+	left: 20,
+	right: 20,
 	linked: true,
 };
 

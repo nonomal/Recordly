@@ -1,5 +1,6 @@
-import { Application, BlurFilter, Container, Graphics, Sprite, Texture } from "pixi.js";
+import { Application, BlurFilter, Container, Graphics, Rectangle, Sprite, Texture } from "pixi.js";
 import { MotionBlurFilter } from "pixi-filters/motion-blur";
+import { ZoomBlurFilter } from "pixi-filters/zoom-blur";
 import { buildActiveCaptionLayout } from "@/components/video-editor/captionLayout";
 import {
 	CAPTION_FONT_WEIGHT,
@@ -24,7 +25,6 @@ import type {
 	ZoomTransitionEasing,
 } from "@/components/video-editor/types";
 import { getDefaultCaptionFontFamily, ZOOM_DEPTH_SCALES } from "@/components/video-editor/types";
-import { computePaddedLayout } from "@/components/video-editor/videoPlayback/layoutUtils";
 import { DEFAULT_FOCUS } from "@/components/video-editor/videoPlayback/constants";
 import {
 	type CursorFollowCameraState,
@@ -37,6 +37,7 @@ import {
 	PixiCursorOverlay,
 	preloadCursorAssets,
 } from "@/components/video-editor/videoPlayback/cursorRenderer";
+import { computePaddedLayout } from "@/components/video-editor/videoPlayback/layoutUtils";
 import {
 	createSpringState,
 	getZoomSpringConfig,
@@ -44,6 +45,7 @@ import {
 	type SpringState,
 	stepSpringValue,
 } from "@/components/video-editor/videoPlayback/motionSmoothing";
+import { getWebcamMediaTargetTimeSeconds } from "@/components/video-editor/videoPlayback/webcamSync";
 import { findDominantRegion } from "@/components/video-editor/videoPlayback/zoomRegionUtils";
 import {
 	applyZoomTransform,
@@ -56,7 +58,7 @@ import {
 	getWebcamOverlayPosition,
 	getWebcamOverlaySizePx,
 } from "@/components/video-editor/webcamOverlay";
-import { getAssetPath, getRenderableAssetUrl } from "@/lib/assetPath";
+import { getAssetPath, getExportableVideoUrl, getRenderableAssetUrl } from "@/lib/assetPath";
 import { extensionHost } from "@/lib/extensions";
 import {
 	mapCursorToCanvasNormalized,
@@ -69,7 +71,10 @@ import {
 } from "@/lib/extensions/renderHooks";
 import { applyCanvasSceneTransform } from "@/lib/extensions/sceneTransform";
 import { drawSquircleOnCanvas, drawSquircleOnGraphics } from "@/lib/geometry/squircle";
-import { clampMediaTimeToDuration } from "@/lib/mediaTiming";
+import {
+	clampMediaTimeToDuration,
+	getEffectiveVideoStreamDurationSeconds,
+} from "@/lib/mediaTiming";
 import { isVideoWallpaperSource } from "@/lib/wallpapers";
 import {
 	type AnnotationRenderAssets,
@@ -84,6 +89,10 @@ import {
 	VIDEO_SHADOW_LAYER_PROFILES,
 	WEBCAM_SHADOW_LAYER_PROFILES,
 } from "./shadowProfile";
+import {
+	buildTemporalSamplePlanUs,
+	getTemporalMotionBlurConfig,
+} from "./temporalMotionBlur";
 import type { ExportRenderBackend } from "./types";
 
 interface FrameRenderConfig {
@@ -96,6 +105,9 @@ interface FrameRenderConfig {
 	shadowIntensity: number;
 	backgroundBlur: number;
 	zoomMotionBlur?: number;
+	zoomTemporalMotionBlur?: number;
+	zoomMotionBlurSampleCount?: number | null;
+	zoomMotionBlurShutterFraction?: number | null;
 	connectZooms?: boolean;
 	zoomInDurationMs?: number;
 	zoomInOverlapMs?: number;
@@ -123,6 +135,9 @@ interface FrameRenderConfig {
 	cursorStyle?: CursorStyle;
 	cursorSize?: number;
 	cursorSmoothing?: number;
+	cursorSpringStiffnessMultiplier?: number;
+	cursorSpringDampingMultiplier?: number;
+	cursorSpringMassMultiplier?: number;
 	cursorMotionBlur?: number;
 	cursorClickBounce?: number;
 	cursorClickBounceDuration?: number;
@@ -214,6 +229,14 @@ interface CaptionRenderState {
 	boxHeight: number;
 	centerX: number;
 	centerY: number;
+}
+
+interface RenderSnapshot {
+	timeMs: number;
+	cursorTimeMs: number;
+	backgroundTimelineTimeMs: number;
+	sceneTransform: { scale: number; x: number; y: number };
+	zoom: { scale: number; focusX: number; focusY: number; progress: number };
 }
 
 function createAnimationState(): AnimationState {
@@ -322,15 +345,20 @@ export class FrameRenderer {
 	private backgroundTextureSource: MutableVideoTextureSource | null = null;
 	private videoMaskGraphics: Graphics | null = null;
 	private webcamMaskGraphics: Graphics | null = null;
-	private blurFilter: BlurFilter | null = null;
+	private zoomBlurFilter: ZoomBlurFilter | null = null;
 	private motionBlurFilter: MotionBlurFilter | null = null;
 	private backgroundBlurFilter: BlurFilter | null = null;
 	private annotationAssets: AnnotationRenderAssets | null = null;
 	private annotationScaleFactor = 1;
 	private annotationSprites: AnnotationSpriteEntry[] = [];
 	private backgroundForwardFrameSource: ForwardFrameSource | null = null;
+	private backgroundForwardFrameSourceUrl: string | null = null;
+	private backgroundForwardFrameDurationSec: number | null = null;
 	private backgroundDecodedFrame: VideoFrame | null = null;
 	private backgroundVideoElement: HTMLVideoElement | null = null;
+	private backgroundSeekPromise: Promise<void> | null = null;
+	private cleanupBackgroundSource: (() => void) | null = null;
+	private lastSyncedBackgroundLoopTimeSec: number | null = null;
 	private videoShadowLayers: ShadowLayer[] = [];
 	private webcamShadowLayers: ShadowLayer[] = [];
 	private webcamSprite: Sprite | null = null;
@@ -343,6 +371,8 @@ export class FrameRenderer {
 	private webcamFrameCacheCtx: CanvasRenderingContext2D | null = null;
 	private sceneVideoFrameStagingCanvas: HTMLCanvasElement | null = null;
 	private sceneVideoFrameStagingCtx: CanvasRenderingContext2D | null = null;
+	private backgroundVideoFrameStagingCanvas: HTMLCanvasElement | null = null;
+	private backgroundVideoFrameStagingCtx: CanvasRenderingContext2D | null = null;
 	private webcamVideoFrameStagingCanvas: HTMLCanvasElement | null = null;
 	private webcamVideoFrameStagingCtx: CanvasRenderingContext2D | null = null;
 	private captionMeasureCanvas: HTMLCanvasElement | null = null;
@@ -353,6 +383,7 @@ export class FrameRenderer {
 	private captionTextureSource: MutableVideoTextureSource | null = null;
 	private captionRenderKey: string | null = null;
 	private exportCompositeCanvas: ExportCompositeCanvasState | null = null;
+	private temporalCompositeCanvas: ExportCompositeCanvasState | null = null;
 	private outputCanvasOverride: HTMLCanvasElement | null = null;
 	private config: FrameRenderConfig;
 	private animationState: AnimationState;
@@ -397,8 +428,8 @@ export class FrameRenderer {
 		}
 
 		const activeFilters =
-			this.shouldUseZoomMotionBlur() && this.motionBlurFilter
-				? [this.motionBlurFilter]
+			this.shouldUseZoomMotionBlur() && this.zoomBlurFilter && this.motionBlurFilter
+				? [this.zoomBlurFilter, this.motionBlurFilter]
 				: null;
 		this.videoEffectsContainer.filters = activeFilters;
 	}
@@ -455,6 +486,12 @@ export class FrameRenderer {
 		this.cameraContainer.addChild(this.videoEffectsContainer);
 		this.cameraContainer.addChild(this.cursorContainer);
 		this.videoEffectsContainer.addChild(this.videoContainer);
+		this.videoEffectsContainer.filterArea = new Rectangle(
+			0,
+			0,
+			this.config.width,
+			this.config.height,
+		);
 
 		this.webcamShadowLayers = this.createShadowLayers(
 			this.webcamRootContainer,
@@ -481,6 +518,11 @@ export class FrameRenderer {
 				style: this.config.cursorStyle ?? "tahoe",
 				smoothingFactor:
 					this.config.cursorSmoothing ?? DEFAULT_CURSOR_CONFIG.smoothingFactor,
+				springTuning: {
+					stiffnessMultiplier: this.config.cursorSpringStiffnessMultiplier,
+					dampingMultiplier: this.config.cursorSpringDampingMultiplier,
+					massMultiplier: this.config.cursorSpringMassMultiplier,
+				},
 				motionBlur: this.config.cursorMotionBlur ?? 0,
 				clickBounce: this.config.cursorClickBounce ?? DEFAULT_CURSOR_CONFIG.clickBounce,
 				clickBounceDuration:
@@ -499,6 +541,11 @@ export class FrameRenderer {
 		await this.setupAnnotationLayer();
 		this.setupCaptionResources();
 
+		if (this.shouldUseZoomMotionBlur()) {
+			this.zoomBlurFilter = new ZoomBlurFilter({ strength: 0 });
+			this.motionBlurFilter = new MotionBlurFilter([0, 0], 5, 0);
+		}
+
 		this.compositeCanvas = document.createElement("canvas");
 		this.compositeCanvas.width = this.config.width;
 		this.compositeCanvas.height = this.config.height;
@@ -511,9 +558,6 @@ export class FrameRenderer {
 			throw new Error("Failed to get 2D context for composite canvas");
 		}
 
-		if (this.shouldUseZoomMotionBlur()) {
-			this.motionBlurFilter = new MotionBlurFilter([0, 0], 5, 0);
-		}
 		this.updateVideoEffectsFilterState();
 
 		console.log(`[FrameRenderer] Export renderer backend: ${this.rendererBackend}`);
@@ -707,7 +751,7 @@ export class FrameRenderer {
 	}
 
 	private ensureVideoFrameStagingCanvas(
-		kind: "scene" | "webcam",
+		kind: "scene" | "background" | "webcam",
 		width: number,
 		height: number,
 	): { canvas: HTMLCanvasElement; context: CanvasRenderingContext2D } | null {
@@ -716,9 +760,15 @@ export class FrameRenderer {
 		const currentCanvas =
 			kind === "scene"
 				? this.sceneVideoFrameStagingCanvas
-				: this.webcamVideoFrameStagingCanvas;
+				: kind === "background"
+					? this.backgroundVideoFrameStagingCanvas
+					: this.webcamVideoFrameStagingCanvas;
 		const currentContext =
-			kind === "scene" ? this.sceneVideoFrameStagingCtx : this.webcamVideoFrameStagingCtx;
+			kind === "scene"
+				? this.sceneVideoFrameStagingCtx
+				: kind === "background"
+					? this.backgroundVideoFrameStagingCtx
+					: this.webcamVideoFrameStagingCtx;
 
 		if (
 			currentCanvas &&
@@ -732,7 +782,9 @@ export class FrameRenderer {
 		const canvas = document.createElement("canvas");
 		canvas.width = targetWidth;
 		canvas.height = targetHeight;
-		const context = configureHighQuality2DContext(canvas.getContext("2d"));
+		const context = configureHighQuality2DContext(
+			canvas.getContext("2d", { willReadFrequently: true }),
+		);
 		if (!context) {
 			return null;
 		}
@@ -740,6 +792,9 @@ export class FrameRenderer {
 		if (kind === "scene") {
 			this.sceneVideoFrameStagingCanvas = canvas;
 			this.sceneVideoFrameStagingCtx = context;
+		} else if (kind === "background") {
+			this.backgroundVideoFrameStagingCanvas = canvas;
+			this.backgroundVideoFrameStagingCtx = context;
 		} else {
 			this.webcamVideoFrameStagingCanvas = canvas;
 			this.webcamVideoFrameStagingCtx = context;
@@ -750,7 +805,7 @@ export class FrameRenderer {
 
 	private stageVideoFrameForTexture(
 		frame: VideoFrame,
-		kind: "scene" | "webcam",
+		kind: "scene" | "background" | "webcam",
 		fallbackWidth: number,
 		fallbackHeight: number,
 	): CanvasImageSource | VideoFrame {
@@ -812,7 +867,12 @@ export class FrameRenderer {
 		this.backgroundForwardFrameSource?.cancel();
 		void this.backgroundForwardFrameSource?.destroy();
 		this.backgroundForwardFrameSource = null;
+		this.backgroundForwardFrameSourceUrl = null;
+		this.backgroundForwardFrameDurationSec = null;
 		this.closeBackgroundDecodedFrame();
+		this.cleanupBackgroundSource?.();
+		this.cleanupBackgroundSource = null;
+		this.lastSyncedBackgroundLoopTimeSec = null;
 
 		if (this.backgroundVideoElement) {
 			this.backgroundVideoElement.pause();
@@ -845,30 +905,63 @@ export class FrameRenderer {
 
 				try {
 					const frameSource = new ForwardFrameSource();
-					await frameSource.initialize(videoSrc);
+					const metadata = await frameSource.initialize(videoSrc);
 					this.backgroundForwardFrameSource = frameSource;
+					this.backgroundForwardFrameSourceUrl = videoSrc;
+					this.backgroundForwardFrameDurationSec = getEffectiveVideoStreamDurationSeconds(
+						{
+							duration: metadata?.duration,
+							streamDuration: metadata?.streamDuration,
+						},
+					);
+					this.backgroundVideoElement = null;
+					this.backgroundSeekPromise = null;
+					this.lastSyncedBackgroundLoopTimeSec = null;
 					return;
 				} catch (error) {
 					console.warn(
-						"[FrameRenderer] Decoder-backed wallpaper source unavailable during export; falling back to media element sync:",
+						"[FrameRenderer] Decoder-backed video wallpaper unavailable during export; falling back to media element sync:",
 						error,
 					);
 				}
+
+				const backgroundSource = await resolveMediaElementSource(videoSrc);
+				this.cleanupBackgroundSource = backgroundSource.revoke;
 
 				const video = document.createElement("video");
 				video.muted = true;
 				video.loop = true;
 				video.playsInline = true;
 				video.preload = "auto";
-				video.src = videoSrc;
+				video.src = backgroundSource.src;
+				video.load();
 
 				await new Promise<void>((resolve, reject) => {
-					video.onloadeddata = () => resolve();
-					video.onerror = () =>
+					const onReady = () => {
+						if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+							return;
+						}
+						cleanup();
+						resolve();
+					};
+					const onError = () => {
+						cleanup();
 						reject(new Error(`Failed to load video wallpaper: ${wallpaper}`));
+					};
+					const cleanup = () => {
+						video.removeEventListener("loadeddata", onReady);
+						video.removeEventListener("canplay", onReady);
+						video.removeEventListener("error", onError);
+					};
+
+					video.addEventListener("loadeddata", onReady);
+					video.addEventListener("canplay", onReady);
+					video.addEventListener("error", onError);
+					onReady();
 				});
 
 				this.backgroundVideoElement = video;
+				this.lastSyncedBackgroundLoopTimeSec = null;
 				this.ensureBackgroundSprite(video, video.videoWidth, video.videoHeight);
 				return;
 			}
@@ -1018,8 +1111,41 @@ export class FrameRenderer {
 			return;
 		}
 
+		const resolvedSource =
+			typeof VideoFrame !== "undefined" && source instanceof VideoFrame
+				? this.stageVideoFrameForTexture(source, "background", sourceWidth, sourceHeight)
+				: typeof HTMLVideoElement !== "undefined" &&
+						source instanceof HTMLVideoElement &&
+						sourceWidth > 0 &&
+						sourceHeight > 0
+					? (() => {
+							const staging = this.ensureVideoFrameStagingCanvas(
+								"background",
+								sourceWidth,
+								sourceHeight,
+							);
+							if (!staging) {
+								return source;
+							}
+							staging.context.clearRect(
+								0,
+								0,
+								staging.canvas.width,
+								staging.canvas.height,
+							);
+							staging.context.drawImage(
+								source,
+								0,
+								0,
+								staging.canvas.width,
+								staging.canvas.height,
+							);
+							return staging.canvas;
+						})()
+					: source;
+
 		if (!this.backgroundSprite) {
-			const texture = this.createTextureFromSource(source);
+			const texture = this.createTextureFromSource(resolvedSource);
 			this.backgroundSprite = new Sprite(texture);
 			this.backgroundTextureSource = texture.source as unknown as MutableVideoTextureSource;
 			this.backgroundContainer.addChild(this.backgroundSprite);
@@ -1032,7 +1158,7 @@ export class FrameRenderer {
 				this.backgroundSprite.filters = [this.backgroundBlurFilter];
 			}
 		} else if (this.backgroundTextureSource) {
-			this.backgroundTextureSource.resource = source;
+			this.backgroundTextureSource.resource = resolvedSource;
 			this.backgroundTextureSource.update();
 		}
 
@@ -1073,6 +1199,29 @@ export class FrameRenderer {
 
 		this.backgroundDecodedFrame.close();
 		this.backgroundDecodedFrame = null;
+	}
+
+	private async restartBackgroundForwardFrameSource(): Promise<void> {
+		const sourceUrl = this.backgroundForwardFrameSourceUrl;
+		if (!sourceUrl) {
+			return;
+		}
+
+		const nextSource = new ForwardFrameSource();
+		const metadata = await nextSource.initialize(sourceUrl);
+		const previousSource = this.backgroundForwardFrameSource;
+
+		this.backgroundForwardFrameSource = nextSource;
+		const effectiveDuration = getEffectiveVideoStreamDurationSeconds({
+			duration: metadata?.duration,
+			streamDuration: metadata?.streamDuration,
+		});
+		this.backgroundForwardFrameDurationSec =
+			Number.isFinite(effectiveDuration) && effectiveDuration > 0 ? effectiveDuration : null;
+		this.lastSyncedBackgroundLoopTimeSec = null;
+
+		previousSource?.cancel();
+		void previousSource?.destroy();
 	}
 
 	private calculateAnnotationScaleFactor(): number {
@@ -1121,6 +1270,35 @@ export class FrameRenderer {
 		return this.exportCompositeCanvas;
 	}
 
+	private ensureTemporalCompositeCanvas(): ExportCompositeCanvasState | null {
+		const targetWidth = Math.max(1, Math.ceil(this.config.width));
+		const targetHeight = Math.max(1, Math.ceil(this.config.height));
+
+		if (
+			this.temporalCompositeCanvas &&
+			this.temporalCompositeCanvas.canvas.width === targetWidth &&
+			this.temporalCompositeCanvas.canvas.height === targetHeight
+		) {
+			return this.temporalCompositeCanvas;
+		}
+
+		const canvas = document.createElement("canvas");
+		canvas.width = targetWidth;
+		canvas.height = targetHeight;
+
+		const context = configureHighQuality2DContext(canvas.getContext("2d"));
+		if (!context) {
+			return null;
+		}
+
+		this.temporalCompositeCanvas = {
+			canvas,
+			context,
+		};
+
+		return this.temporalCompositeCanvas;
+	}
+
 	private drawCaptionOverlay(context: CanvasRenderingContext2D): void {
 		if (
 			!this.captionContainer?.visible ||
@@ -1141,7 +1319,10 @@ export class FrameRenderer {
 		context.restore();
 	}
 
-	private async composeBlurAnnotationFrame(timeMs: number): Promise<void> {
+	private async composeBlurAnnotationFrame(
+		timeMs: number,
+		sourceCanvas?: CanvasImageSource,
+	): Promise<void> {
 		if (!this.app) {
 			this.outputCanvasOverride = null;
 			return;
@@ -1155,7 +1336,7 @@ export class FrameRenderer {
 
 		const { canvas, context } = compositeState;
 		context.clearRect(0, 0, canvas.width, canvas.height);
-		context.drawImage(this.app.canvas as HTMLCanvasElement, 0, 0);
+		context.drawImage(sourceCanvas ?? (this.app.canvas as HTMLCanvasElement), 0, 0);
 
 		await renderAnnotations(
 			context,
@@ -1427,14 +1608,85 @@ export class FrameRenderer {
 
 	private async syncBackgroundFrame(timeSeconds: number): Promise<void> {
 		if (this.backgroundForwardFrameSource) {
-			const decodedFrame = await this.backgroundForwardFrameSource.getFrameAtTime(
-				Math.max(0, timeSeconds),
-			);
+			const duration = this.backgroundForwardFrameDurationSec;
+			const shouldLoop = Number.isFinite(duration) && (duration ?? 0) > 0;
+			let normalizedTargetTime = shouldLoop
+				? ((timeSeconds % duration!) + duration!) % duration!
+				: Math.max(0, timeSeconds);
+
+			if (
+				shouldLoop &&
+				this.lastSyncedBackgroundLoopTimeSec !== null &&
+				normalizedTargetTime + 0.001 < this.lastSyncedBackgroundLoopTimeSec
+			) {
+				try {
+					await this.restartBackgroundForwardFrameSource();
+				} catch (error) {
+					console.warn(
+						"[FrameRenderer] Unable to restart looping video wallpaper decoder during export:",
+						error,
+					);
+				}
+			}
+
+			const decodedFrame =
+				await this.backgroundForwardFrameSource.getFrameAtTime(normalizedTargetTime);
+			const resolvedDecodedDuration =
+				this.backgroundForwardFrameSource.getResolvedDurationSec();
+			if (
+				shouldLoop &&
+				this.backgroundForwardFrameSource.hasReachedEndOfStream() &&
+				Number.isFinite(resolvedDecodedDuration) &&
+				(resolvedDecodedDuration ?? 0) > 0 &&
+				normalizedTargetTime > (resolvedDecodedDuration ?? 0) + 0.001
+			) {
+				this.backgroundForwardFrameDurationSec = resolvedDecodedDuration ?? null;
+				this.closeBackgroundDecodedFrame();
+				decodedFrame?.close();
+				try {
+					await this.restartBackgroundForwardFrameSource();
+					normalizedTargetTime =
+						((timeSeconds % resolvedDecodedDuration!) + resolvedDecodedDuration!) %
+						resolvedDecodedDuration!;
+					const restartedFrame =
+						await this.backgroundForwardFrameSource.getFrameAtTime(
+							normalizedTargetTime,
+						);
+					this.backgroundDecodedFrame = restartedFrame;
+					if (restartedFrame) {
+						this.lastSyncedBackgroundLoopTimeSec = normalizedTargetTime;
+						const resolvedBackgroundSource = this.stageVideoFrameForTexture(
+							restartedFrame,
+							"background",
+							restartedFrame.displayWidth,
+							restartedFrame.displayHeight,
+						);
+						this.ensureBackgroundSprite(
+							resolvedBackgroundSource,
+							restartedFrame.displayWidth,
+							restartedFrame.displayHeight,
+						);
+					}
+					return;
+				} catch (error) {
+					console.warn(
+						"[FrameRenderer] Unable to wrap looping video wallpaper at decoded EOF during export:",
+						error,
+					);
+				}
+			}
 			this.closeBackgroundDecodedFrame();
 			this.backgroundDecodedFrame = decodedFrame;
 			if (decodedFrame) {
-				this.ensureBackgroundSprite(
+				this.lastSyncedBackgroundLoopTimeSec = normalizedTargetTime;
+				const resolvedBackgroundSource = this.stageVideoFrameForTexture(
 					decodedFrame,
+					"background",
+					decodedFrame.displayWidth,
+					decodedFrame.displayHeight,
+				);
+				this.ensureBackgroundSprite(
+					resolvedBackgroundSource,
 					decodedFrame.displayWidth,
 					decodedFrame.displayHeight,
 				);
@@ -1450,14 +1702,120 @@ export class FrameRenderer {
 		if (video.duration && Number.isFinite(video.duration)) {
 			const targetTime = timeSeconds % video.duration;
 			if (Math.abs(video.currentTime - targetTime) > 0.008) {
-				video.currentTime = targetTime;
-				await new Promise<void>((resolve) => {
-					const onSeeked = () => {
-						video.removeEventListener("seeked", onSeeked);
+				if (this.backgroundSeekPromise) {
+					await this.backgroundSeekPromise;
+				}
+
+				this.backgroundSeekPromise = new Promise<void>((resolve) => {
+					let settled = false;
+					let fallbackTimeout: number | null = null;
+					let animationFrameRequestId: number | null = null;
+					let videoFrameRequestId: number | null = null;
+
+					const finish = () => {
+						if (settled) {
+							return;
+						}
+						settled = true;
+						cleanup();
 						resolve();
 					};
-					video.addEventListener("seeked", onSeeked);
+
+					const waitForPresentedFrame = () => {
+						const requestVideoFrameCallback = (
+							video as HTMLVideoElement & {
+								requestVideoFrameCallback?: (
+									callback: (
+										now: DOMHighResTimeStamp,
+										metadata: VideoFrameCallbackMetadata,
+									) => void,
+								) => number;
+								cancelVideoFrameCallback?: (handle: number) => void;
+							}
+						).requestVideoFrameCallback;
+
+						animationFrameRequestId = requestAnimationFrame(() => {
+							animationFrameRequestId = null;
+							finish();
+						});
+
+						if (typeof requestVideoFrameCallback === "function") {
+							videoFrameRequestId = requestVideoFrameCallback.call(video, () => {
+								videoFrameRequestId = null;
+								finish();
+							});
+						}
+					};
+
+					const handleMediaReady = () => {
+						if (
+							!video.seeking &&
+							Math.abs(video.currentTime - targetTime) <= 0.01 &&
+							video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+						) {
+							waitForPresentedFrame();
+						}
+					};
+
+					const cleanup = () => {
+						video.removeEventListener("seeked", waitForPresentedFrame);
+						video.removeEventListener("loadeddata", handleMediaReady);
+						video.removeEventListener("canplay", handleMediaReady);
+						video.removeEventListener("error", finish);
+						if (animationFrameRequestId !== null) {
+							cancelAnimationFrame(animationFrameRequestId);
+							animationFrameRequestId = null;
+						}
+						if (
+							videoFrameRequestId !== null &&
+							typeof (
+								video as HTMLVideoElement & {
+									cancelVideoFrameCallback?: (handle: number) => void;
+								}
+							).cancelVideoFrameCallback === "function"
+						) {
+							(
+								video as HTMLVideoElement & {
+									cancelVideoFrameCallback: (handle: number) => void;
+								}
+							).cancelVideoFrameCallback(videoFrameRequestId);
+							videoFrameRequestId = null;
+						}
+						if (fallbackTimeout !== null) {
+							window.clearTimeout(fallbackTimeout);
+						}
+					};
+
+					video.addEventListener("seeked", waitForPresentedFrame, { once: true });
+					video.addEventListener("loadeddata", handleMediaReady, { once: true });
+					video.addEventListener("canplay", handleMediaReady, { once: true });
+					video.addEventListener("error", finish, { once: true });
+
+					fallbackTimeout = window.setTimeout(() => {
+						finish();
+					}, 50);
+
+					try {
+						video.currentTime = targetTime;
+					} catch {
+						finish();
+						return;
+					}
+
+					if (
+						!video.seeking &&
+						Math.abs(video.currentTime - targetTime) <= 0.001 &&
+						video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+					) {
+						waitForPresentedFrame();
+					}
 				});
+
+				try {
+					await this.backgroundSeekPromise;
+				} finally {
+					this.backgroundSeekPromise = null;
+				}
 			}
 		}
 
@@ -1484,6 +1842,10 @@ export class FrameRenderer {
 	private async resolveWallpaperForExport(wallpaper: string): Promise<string> {
 		if (!wallpaper) {
 			return wallpaper;
+		}
+
+		if (isVideoWallpaperSource(wallpaper)) {
+			return getExportableVideoUrl(wallpaper);
 		}
 
 		if (
@@ -1850,8 +2212,13 @@ export class FrameRenderer {
 	}
 
 	private async syncWebcamFrame(targetTime: number): Promise<void> {
-		const webcamTimeOffsetSec = (this.config.webcam?.timeOffsetMs ?? 0) / 1000;
-		const webcamTargetTime = Math.max(0, targetTime + webcamTimeOffsetSec);
+		const webcamTargetTime = getWebcamMediaTargetTimeSeconds({
+			currentTime: targetTime,
+			webcamDuration: Number.isFinite(this.webcamVideoElement?.duration)
+				? this.webcamVideoElement?.duration
+				: null,
+			timeOffsetMs: this.config.webcam?.timeOffsetMs,
+		});
 
 		if (this.webcamForwardFrameSource) {
 			const clampedTime = clampMediaTimeToDuration(webcamTargetTime, null);
@@ -2094,12 +2461,15 @@ export class FrameRenderer {
 		}
 	}
 
-	async renderFrame(
-		videoFrame: VideoFrame,
+	private async renderSceneSample(
 		timestamp: number,
-		cursorTimestamp = timestamp,
-	): Promise<void> {
-		if (!this.app || !this.videoContainer || !this.cameraContainer || !this.videoMaskGraphics) {
+		cursorTimestamp: number,
+		backgroundTimelineTimestamp: number,
+		layoutCache: LayoutCache,
+		useVelocityMotionBlur: boolean,
+		includeOverlayLayers = true,
+	): Promise<RenderSnapshot> {
+		if (!this.app || !this.cameraContainer || !this.videoMaskGraphics) {
 			throw new Error("Renderer not initialized");
 		}
 
@@ -2110,8 +2480,190 @@ export class FrameRenderer {
 		}
 
 		if (this.backgroundForwardFrameSource || this.backgroundVideoElement) {
-			await this.syncBackgroundFrame(this.currentVideoTime);
+			await this.syncBackgroundFrame(Math.max(0, backgroundTimelineTimestamp / 1_000_000));
 		}
+
+		const timeMs = this.currentVideoTime * 1000;
+		const cursorTimeMs = cursorTimestamp / 1000;
+
+		if (this.cursorOverlay) {
+			this.cursorOverlay.update(
+				this.config.cursorTelemetry ?? [],
+				cursorTimeMs,
+				layoutCache.maskRect,
+				this.config.showCursor ?? true,
+				false,
+			);
+		}
+
+		const motionIntensity = this.updateAnimationState(timeMs);
+
+		applyZoomTransform({
+			cameraContainer: this.cameraContainer,
+			zoomBlurFilter: this.zoomBlurFilter,
+			motionBlurFilter: this.motionBlurFilter,
+			stageSize: layoutCache.stageSize,
+			baseMask: layoutCache.maskRect,
+			zoomScale: this.animationState.scale,
+			zoomProgress: this.animationState.progress,
+			focusX: this.animationState.focusX,
+			focusY: this.animationState.focusY,
+			motionIntensity,
+			motionVector: this.lastMotionVector,
+			isPlaying: true,
+			motionBlurAmount: useVelocityMotionBlur ? (this.config.zoomMotionBlur ?? 0) : 0,
+			transformOverride: {
+				scale: this.animationState.appliedScale,
+				x: this.animationState.x,
+				y: this.animationState.y,
+			},
+			motionBlurState: this.motionBlurState,
+			frameTimeMs: timeMs,
+		});
+
+		if (includeOverlayLayers) {
+			this.updateAnnotationLayer(timeMs);
+			this.updateCaptionLayer(timeMs);
+		}
+		this.updateWebcamOverlay();
+
+		const annotationContainerVisible = this.annotationContainer?.visible ?? true;
+		const captionContainerVisible = this.captionContainer?.visible ?? true;
+		if (!includeOverlayLayers) {
+			if (this.annotationContainer) {
+				this.annotationContainer.visible = false;
+			}
+			if (this.captionContainer) {
+				this.captionContainer.visible = false;
+			}
+		}
+
+		this.app.render();
+
+		if (!includeOverlayLayers) {
+			if (this.annotationContainer) {
+				this.annotationContainer.visible = annotationContainerVisible;
+			}
+			if (this.captionContainer) {
+				this.captionContainer.visible = captionContainerVisible;
+			}
+		}
+
+		return {
+			timeMs,
+			cursorTimeMs,
+			backgroundTimelineTimeMs: backgroundTimelineTimestamp / 1000,
+			sceneTransform: {
+				scale: this.animationState.appliedScale,
+				x: this.animationState.x,
+				y: this.animationState.y,
+			},
+			zoom: {
+				scale: this.animationState.scale,
+				focusX: this.animationState.focusX,
+				focusY: this.animationState.focusY,
+				progress: this.animationState.progress,
+			},
+		};
+	}
+
+	private async renderTemporalMotionBlurFrame(
+		timestamp: number,
+		cursorTimestamp: number,
+		backgroundTimelineTimestamp: number,
+		frameDurationUs: number,
+		layoutCache: LayoutCache,
+	): Promise<RenderSnapshot | null> {
+		if (!this.app) {
+			return null;
+		}
+
+		const blurConfig = getTemporalMotionBlurConfig(
+			this.config.zoomTemporalMotionBlur ?? this.config.zoomMotionBlur,
+			{
+				sampleCount: this.config.zoomMotionBlurSampleCount,
+				shutterFraction: this.config.zoomMotionBlurShutterFraction,
+			},
+		);
+		if (!blurConfig) {
+			return null;
+		}
+
+		const compositeState = this.ensureTemporalCompositeCanvas();
+		if (!compositeState) {
+			return null;
+		}
+
+		const samplePlan = buildTemporalSamplePlanUs(frameDurationUs, blurConfig);
+
+		compositeState.context.clearRect(
+			0,
+			0,
+			compositeState.canvas.width,
+			compositeState.canvas.height,
+		);
+
+		let centerSnapshot: RenderSnapshot | null = null;
+		let lastSnapshot: RenderSnapshot | null = null;
+
+		for (const { offsetUs: sampleOffsetUs, weight } of samplePlan) {
+			const sampleTimestamp = Math.max(0, timestamp + sampleOffsetUs);
+			const sampleCursorTimestamp = Math.max(0, cursorTimestamp + sampleOffsetUs);
+			const sampleBackgroundTimelineTimestamp = Math.max(
+				0,
+				backgroundTimelineTimestamp + sampleOffsetUs,
+			);
+			const snapshot = await this.renderSceneSample(
+				sampleTimestamp,
+				sampleCursorTimestamp,
+				sampleBackgroundTimelineTimestamp,
+				layoutCache,
+				false,
+				false,
+			);
+			lastSnapshot = snapshot;
+			if (Math.abs(sampleOffsetUs) < 0.0001) {
+				centerSnapshot = snapshot;
+			}
+
+			compositeState.context.save();
+			compositeState.context.globalCompositeOperation = "lighter";
+			compositeState.context.globalAlpha = weight;
+			compositeState.context.drawImage(this.app.canvas as HTMLCanvasElement, 0, 0);
+			compositeState.context.restore();
+		}
+
+		const resolvedSnapshot = centerSnapshot ?? lastSnapshot;
+		if (!resolvedSnapshot) {
+			return null;
+		}
+
+		this.updateCaptionLayer(resolvedSnapshot.timeMs);
+
+		const hasOverlayCanvasWork =
+			(this.config.annotationRegions?.length ?? 0) > 0 ||
+			Boolean(this.captionCanvas && this.captionSprite?.visible);
+		if (hasOverlayCanvasWork) {
+			await this.composeBlurAnnotationFrame(resolvedSnapshot.timeMs, compositeState.canvas);
+		} else {
+			this.outputCanvasOverride = compositeState.canvas;
+		}
+
+		return resolvedSnapshot;
+	}
+
+	async renderFrame(
+		videoFrame: VideoFrame,
+		timestamp: number,
+		cursorTimestamp = timestamp,
+		frameDurationUs?: number,
+		backgroundTimelineTimestamp = timestamp,
+	): Promise<void> {
+		if (!this.app || !this.videoContainer || !this.cameraContainer || !this.videoMaskGraphics) {
+			throw new Error("Renderer not initialized");
+		}
+
+		this.currentVideoTime = timestamp / 1_000_000;
 
 		const resolvedVideoSource = this.stageVideoFrameForTexture(
 			videoFrame,
@@ -2146,6 +2698,39 @@ export class FrameRenderer {
 			throw new Error("Renderer layout cache is unavailable");
 		}
 
+		const temporalSnapshot =
+			typeof frameDurationUs === "number" && frameDurationUs > 0
+				? await this.renderTemporalMotionBlurFrame(
+						timestamp,
+						cursorTimestamp,
+						backgroundTimelineTimestamp,
+						frameDurationUs,
+						layoutCache,
+					)
+				: null;
+
+		if (temporalSnapshot) {
+			const sourceCanvas =
+				this.outputCanvasOverride ?? this.ensureTemporalCompositeCanvas()?.canvas;
+			if (sourceCanvas && this.shouldCompositeExtensionFrame()) {
+				this.compositeExtensions(
+					temporalSnapshot.timeMs,
+					temporalSnapshot.cursorTimeMs,
+					sourceCanvas,
+				);
+				this.outputCanvasOverride = this.compositeCanvas;
+			}
+			return;
+		}
+
+		if (this.webcamForwardFrameSource || this.webcamVideoElement) {
+			await this.syncWebcamFrame(Math.max(0, this.currentVideoTime));
+		}
+
+		if (this.backgroundForwardFrameSource || this.backgroundVideoElement) {
+			await this.syncBackgroundFrame(Math.max(0, backgroundTimelineTimestamp / 1_000_000));
+		}
+
 		const timeMs = this.currentVideoTime * 1000;
 		const cursorTimeMs = cursorTimestamp / 1000;
 
@@ -2165,7 +2750,7 @@ export class FrameRenderer {
 
 		applyZoomTransform({
 			cameraContainer: this.cameraContainer,
-			blurFilter: this.blurFilter,
+			zoomBlurFilter: this.zoomBlurFilter,
 			motionBlurFilter: this.motionBlurFilter,
 			stageSize: layoutCache.stageSize,
 			baseMask: layoutCache.maskRect,
@@ -2229,7 +2814,11 @@ export class FrameRenderer {
 		);
 	}
 
-	private compositeExtensions(timeMs: number, cursorTimeMs: number): void {
+	private compositeExtensions(
+		timeMs: number,
+		cursorTimeMs: number,
+		sourceCanvas?: CanvasImageSource,
+	): void {
 		if (!this.app || !this.compositeCtx || !this.compositeCanvas) {
 			return;
 		}
@@ -2239,7 +2828,7 @@ export class FrameRenderer {
 		}
 
 		this.compositeCtx.clearRect(0, 0, this.config.width, this.config.height);
-		this.compositeCtx.drawImage(this.app.canvas as HTMLCanvasElement, 0, 0);
+		this.compositeCtx.drawImage(sourceCanvas ?? (this.app.canvas as HTMLCanvasElement), 0, 0);
 
 		const maskRect = this.layoutCache?.maskRect;
 		const smoothedCursor = mapSmoothedCursorToCanvasNormalized(
@@ -2540,6 +3129,8 @@ export class FrameRenderer {
 			timeMs,
 			{
 				connectZooms: this.config.connectZooms,
+				zoomInDurationMs: this.config.zoomInDurationMs,
+				zoomOutDurationMs: this.config.zoomOutDurationMs,
 			},
 		);
 
@@ -2764,7 +3355,7 @@ export class FrameRenderer {
 		if (this.backgroundSprite) {
 			this.backgroundSprite.filters = null;
 		}
-		this.blurFilter?.destroy();
+		this.zoomBlurFilter?.destroy();
 		this.motionBlurFilter?.destroy();
 		this.backgroundBlurFilter?.destroy();
 
@@ -2799,7 +3390,7 @@ export class FrameRenderer {
 		this.backgroundTextureSource = null;
 		this.videoMaskGraphics = null;
 		this.webcamMaskGraphics = null;
-		this.blurFilter = null;
+		this.zoomBlurFilter = null;
 		this.motionBlurFilter = null;
 		this.backgroundBlurFilter = null;
 		this.annotationAssets = null;
@@ -2813,6 +3404,9 @@ export class FrameRenderer {
 		this.backgroundForwardFrameSource?.cancel();
 		void this.backgroundForwardFrameSource?.destroy();
 		this.backgroundForwardFrameSource = null;
+		this.backgroundForwardFrameSourceUrl = null;
+		this.backgroundForwardFrameDurationSec = null;
+		this.lastSyncedBackgroundLoopTimeSec = null;
 		if (this.backgroundVideoElement) {
 			this.backgroundVideoElement.pause();
 			this.backgroundVideoElement.src = "";
@@ -2849,6 +3443,7 @@ export class FrameRenderer {
 		this.captionTextureSource = null;
 		this.captionRenderKey = null;
 		this.exportCompositeCanvas = null;
+		this.temporalCompositeCanvas = null;
 		this.outputCanvasOverride = null;
 
 		this.annotationScaleFactor = 1;

@@ -12,6 +12,9 @@ type PersistedEditorControls = Pick<
 	| "shadowIntensity"
 	| "backgroundBlur"
 	| "zoomMotionBlur"
+	| "zoomTemporalMotionBlur"
+	| "zoomMotionBlurSampleCount"
+	| "zoomMotionBlurShutterFraction"
 	| "connectZooms"
 	| "zoomInDurationMs"
 	| "zoomInOverlapMs"
@@ -26,6 +29,9 @@ type PersistedEditorControls = Pick<
 	| "cursorStyle"
 	| "cursorSize"
 	| "cursorSmoothing"
+	| "cursorSpringStiffnessMultiplier"
+	| "cursorSpringDampingMultiplier"
+	| "cursorSpringMassMultiplier"
 	| "cursorMotionBlur"
 	| "cursorClickBounce"
 	| "cursorClickBounceDuration"
@@ -48,6 +54,22 @@ type PersistedEditorControls = Pick<
 
 type PartialEditorControls = Partial<PersistedEditorControls>;
 
+type PresetAutoCaptionSettings = ProjectEditorState["autoCaptionSettings"];
+
+export interface EditorPresetSnapshot extends PersistedEditorControls {
+	autoCaptionSettings: PresetAutoCaptionSettings;
+	whisperExecutablePath: string | null;
+	whisperModelPath: string | null;
+}
+
+export interface EditorPreset {
+	id: string;
+	name: string;
+	createdAt: string;
+	updatedAt: string;
+	snapshot: EditorPresetSnapshot;
+}
+
 export interface EditorPreferences extends PersistedEditorControls {
 	customAspectWidth: string;
 	customAspectHeight: string;
@@ -58,6 +80,7 @@ export interface EditorPreferences extends PersistedEditorControls {
 }
 
 export const EDITOR_PREFERENCES_STORAGE_KEY = "recordly.editor.preferences";
+export const EDITOR_PRESETS_STORAGE_KEY = "recordly.editor.presets";
 
 const DEFAULT_EDITOR_CONTROLS = normalizeProjectEditor({});
 
@@ -66,6 +89,9 @@ export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
 	shadowIntensity: DEFAULT_EDITOR_CONTROLS.shadowIntensity,
 	backgroundBlur: DEFAULT_EDITOR_CONTROLS.backgroundBlur,
 	zoomMotionBlur: DEFAULT_EDITOR_CONTROLS.zoomMotionBlur,
+	zoomTemporalMotionBlur: DEFAULT_EDITOR_CONTROLS.zoomTemporalMotionBlur,
+	zoomMotionBlurSampleCount: DEFAULT_EDITOR_CONTROLS.zoomMotionBlurSampleCount,
+	zoomMotionBlurShutterFraction: DEFAULT_EDITOR_CONTROLS.zoomMotionBlurShutterFraction,
 	connectZooms: DEFAULT_EDITOR_CONTROLS.connectZooms,
 	zoomInDurationMs: DEFAULT_EDITOR_CONTROLS.zoomInDurationMs,
 	zoomInOverlapMs: DEFAULT_EDITOR_CONTROLS.zoomInOverlapMs,
@@ -80,6 +106,9 @@ export const DEFAULT_EDITOR_PREFERENCES: EditorPreferences = {
 	cursorStyle: DEFAULT_EDITOR_CONTROLS.cursorStyle,
 	cursorSize: DEFAULT_EDITOR_CONTROLS.cursorSize,
 	cursorSmoothing: DEFAULT_EDITOR_CONTROLS.cursorSmoothing,
+	cursorSpringStiffnessMultiplier: DEFAULT_EDITOR_CONTROLS.cursorSpringStiffnessMultiplier,
+	cursorSpringDampingMultiplier: DEFAULT_EDITOR_CONTROLS.cursorSpringDampingMultiplier,
+	cursorSpringMassMultiplier: DEFAULT_EDITOR_CONTROLS.cursorSpringMassMultiplier,
 	cursorMotionBlur: DEFAULT_EDITOR_CONTROLS.cursorMotionBlur,
 	cursorClickBounce: DEFAULT_EDITOR_CONTROLS.cursorClickBounce,
 	cursorClickBounceDuration: DEFAULT_EDITOR_CONTROLS.cursorClickBounceDuration,
@@ -144,6 +173,88 @@ function normalizeNullablePath(value: unknown): string | null {
 	return trimmed.length > 0 ? trimmed : null;
 }
 
+function normalizePresetAutoCaptionSettings(value: unknown): PresetAutoCaptionSettings {
+	return normalizeProjectEditor({
+		autoCaptionSettings:
+			value && typeof value === "object" ? (value as PresetAutoCaptionSettings) : undefined,
+	}).autoCaptionSettings;
+}
+
+function normalizeEditorPresetSnapshot(candidate: unknown): EditorPresetSnapshot {
+	const normalizedPreferences = normalizeEditorPreferences(candidate);
+	const raw =
+		candidate && typeof candidate === "object"
+			? (candidate as Partial<EditorPresetSnapshot>)
+			: {};
+
+	return {
+		...normalizeEditorControls(normalizedPreferences, normalizedPreferences),
+		autoCaptionSettings: normalizePresetAutoCaptionSettings(raw.autoCaptionSettings),
+		whisperExecutablePath:
+			normalizeNullablePath(raw.whisperExecutablePath) ??
+			normalizedPreferences.whisperExecutablePath,
+		whisperModelPath:
+			normalizeNullablePath(raw.whisperModelPath) ?? normalizedPreferences.whisperModelPath,
+	};
+}
+
+function normalizePresetName(value: unknown): string | null {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	const trimmed = value.trim().replace(/\s+/g, " ");
+	return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizePresetTimestamp(value: unknown, fallback: string): string {
+	if (typeof value !== "string") {
+		return fallback;
+	}
+
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback;
+}
+
+function normalizeEditorPreset(candidate: unknown): EditorPreset | null {
+	if (!candidate || typeof candidate !== "object") {
+		return null;
+	}
+
+	const raw = candidate as Partial<EditorPreset>;
+	const name = normalizePresetName(raw.name);
+	if (!name) {
+		return null;
+	}
+
+	const timestamp = new Date().toISOString();
+	const id =
+		typeof raw.id === "string" && raw.id.trim().length > 0 ? raw.id : crypto.randomUUID();
+
+	return {
+		id,
+		name,
+		createdAt: normalizePresetTimestamp(raw.createdAt, timestamp),
+		updatedAt: normalizePresetTimestamp(raw.updatedAt, timestamp),
+		snapshot: normalizeEditorPresetSnapshot(raw.snapshot),
+	};
+}
+
+function normalizeEditorPresets(candidates: unknown): EditorPreset[] {
+	if (!Array.isArray(candidates)) {
+		return [];
+	}
+
+	return candidates
+		.map((item) => normalizeEditorPreset(item))
+		.filter((preset): preset is EditorPreset => preset !== null)
+		.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function serializeEditorPresetSnapshot(snapshot: EditorPresetSnapshot): string {
+	return JSON.stringify(normalizeEditorPresetSnapshot(snapshot));
+}
+
 function normalizeEditorControls(
 	raw: Partial<EditorPreferences>,
 	fallback: EditorPreferences,
@@ -153,6 +264,11 @@ function normalizeEditorControls(
 		shadowIntensity: raw.shadowIntensity ?? fallback.shadowIntensity,
 		backgroundBlur: raw.backgroundBlur ?? fallback.backgroundBlur,
 		zoomMotionBlur: raw.zoomMotionBlur ?? fallback.zoomMotionBlur,
+		zoomTemporalMotionBlur: raw.zoomTemporalMotionBlur ?? fallback.zoomTemporalMotionBlur,
+		zoomMotionBlurSampleCount:
+			raw.zoomMotionBlurSampleCount ?? fallback.zoomMotionBlurSampleCount,
+		zoomMotionBlurShutterFraction:
+			raw.zoomMotionBlurShutterFraction ?? fallback.zoomMotionBlurShutterFraction,
 		connectZooms: raw.connectZooms ?? fallback.connectZooms,
 		zoomInDurationMs: raw.zoomInDurationMs ?? fallback.zoomInDurationMs,
 		zoomInOverlapMs: raw.zoomInOverlapMs ?? fallback.zoomInOverlapMs,
@@ -167,6 +283,12 @@ function normalizeEditorControls(
 		cursorStyle: raw.cursorStyle ?? fallback.cursorStyle,
 		cursorSize: raw.cursorSize ?? fallback.cursorSize,
 		cursorSmoothing: raw.cursorSmoothing ?? fallback.cursorSmoothing,
+		cursorSpringStiffnessMultiplier:
+			raw.cursorSpringStiffnessMultiplier ?? fallback.cursorSpringStiffnessMultiplier,
+		cursorSpringDampingMultiplier:
+			raw.cursorSpringDampingMultiplier ?? fallback.cursorSpringDampingMultiplier,
+		cursorSpringMassMultiplier:
+			raw.cursorSpringMassMultiplier ?? fallback.cursorSpringMassMultiplier,
 		cursorMotionBlur: raw.cursorMotionBlur ?? fallback.cursorMotionBlur,
 		cursorClickBounce: raw.cursorClickBounce ?? fallback.cursorClickBounce,
 		cursorClickBounceDuration:
@@ -204,6 +326,9 @@ function normalizeEditorControls(
 		shadowIntensity: normalized.shadowIntensity,
 		backgroundBlur: normalized.backgroundBlur,
 		zoomMotionBlur: normalized.zoomMotionBlur,
+		zoomTemporalMotionBlur: normalized.zoomTemporalMotionBlur,
+		zoomMotionBlurSampleCount: normalized.zoomMotionBlurSampleCount,
+		zoomMotionBlurShutterFraction: normalized.zoomMotionBlurShutterFraction,
 		connectZooms: normalized.connectZooms,
 		zoomInDurationMs: normalized.zoomInDurationMs,
 		zoomInOverlapMs: normalized.zoomInOverlapMs,
@@ -218,6 +343,9 @@ function normalizeEditorControls(
 		cursorStyle: normalized.cursorStyle,
 		cursorSize: normalized.cursorSize,
 		cursorSmoothing: normalized.cursorSmoothing,
+		cursorSpringStiffnessMultiplier: normalized.cursorSpringStiffnessMultiplier,
+		cursorSpringDampingMultiplier: normalized.cursorSpringDampingMultiplier,
+		cursorSpringMassMultiplier: normalized.cursorSpringMassMultiplier,
 		cursorMotionBlur: normalized.cursorMotionBlur,
 		cursorClickBounce: normalized.cursorClickBounce,
 		cursorClickBounceDuration: normalized.cursorClickBounceDuration,
@@ -298,5 +426,37 @@ export function saveEditorPreferences(preferences: Partial<EditorPreferences>): 
 		globalThis.localStorage.setItem(EDITOR_PREFERENCES_STORAGE_KEY, JSON.stringify(merged));
 	} catch {
 		// Ignore storage failures so editor controls still work.
+	}
+}
+
+export function loadEditorPresets(): EditorPreset[] {
+	if (typeof globalThis.localStorage === "undefined") {
+		return [];
+	}
+
+	try {
+		const stored = globalThis.localStorage.getItem(EDITOR_PRESETS_STORAGE_KEY);
+		if (!stored) {
+			return [];
+		}
+
+		return normalizeEditorPresets(JSON.parse(stored));
+	} catch {
+		return [];
+	}
+}
+
+export function saveEditorPresets(presets: EditorPreset[]): boolean {
+	if (typeof globalThis.localStorage === "undefined") {
+		return false;
+	}
+
+	try {
+		const normalized = normalizeEditorPresets(presets);
+		globalThis.localStorage.setItem(EDITOR_PRESETS_STORAGE_KEY, JSON.stringify(normalized));
+		return true;
+	} catch {
+		// Ignore storage failures so editor controls still work.
+		return false;
 	}
 }

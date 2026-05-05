@@ -1,13 +1,6 @@
-import {
-	Application,
-	BlurFilter,
-	Container,
-	Graphics,
-	Sprite,
-	Texture,
-	VideoSource,
-} from "pixi.js";
+import { Application, Container, Graphics, Rectangle, Sprite, Texture, VideoSource } from "pixi.js";
 import { MotionBlurFilter } from "pixi-filters/motion-blur";
+import { ZoomBlurFilter } from "pixi-filters/zoom-blur";
 import type React from "react";
 import {
 	forwardRef,
@@ -18,8 +11,8 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { getAssetPath, getRenderableAssetUrl } from "@/lib/assetPath";
-import { clampMediaTimeToDuration } from "@/lib/mediaTiming";
+import { getAssetPath, getRenderableAssetUrl, getRenderableVideoUrl } from "@/lib/assetPath";
+import { clampMediaTimeToDuration, getMediaSyncPlaybackRate } from "@/lib/mediaTiming";
 import {
 	DEFAULT_WALLPAPER_PATH,
 	DEFAULT_WALLPAPER_RELATIVE_PATH,
@@ -101,6 +94,7 @@ import {
 	DEFAULT_CURSOR_SIZE,
 	DEFAULT_CURSOR_SMOOTHING,
 	DEFAULT_CURSOR_SWAY,
+	DEFAULT_PADDING,
 	DEFAULT_WEBCAM_CORNER_RADIUS,
 	DEFAULT_WEBCAM_REACT_TO_ZOOM,
 	DEFAULT_WEBCAM_SHADOW,
@@ -110,7 +104,6 @@ import {
 	DEFAULT_ZOOM_IN_OVERLAP_MS,
 	DEFAULT_ZOOM_OUT_DURATION_MS,
 	DEFAULT_ZOOM_OUT_EASING,
-	DEFAULT_PADDING,
 	getDefaultCaptionFontFamily,
 } from "./types";
 import {
@@ -124,6 +117,7 @@ import { clampFocusToStage as clampFocusToStageUtil } from "./videoPlayback/focu
 import { layoutVideoContent as layoutVideoContentUtil } from "./videoPlayback/layoutUtils";
 import { updateOverlayIndicator } from "./videoPlayback/overlayUtils";
 import { createVideoEventHandlers } from "./videoPlayback/videoEventHandlers";
+import { getWebcamMediaTargetTimeSeconds } from "./videoPlayback/webcamSync";
 import { findDominantRegion } from "./videoPlayback/zoomRegionUtils";
 import {
 	applyZoomTransform,
@@ -231,7 +225,6 @@ interface VideoPlaybackProps {
 	showShadow?: boolean;
 	shadowIntensity?: number;
 	backgroundBlur?: number;
-	zoomMotionBlur?: number;
 	connectZooms?: boolean;
 	zoomInDurationMs?: number;
 	zoomInOverlapMs?: number;
@@ -262,6 +255,9 @@ interface VideoPlaybackProps {
 	cursorStyle?: CursorStyle;
 	cursorSize?: number;
 	cursorSmoothing?: number;
+	cursorSpringStiffnessMultiplier?: number;
+	cursorSpringDampingMultiplier?: number;
+	cursorSpringMassMultiplier?: number;
 	zoomSmoothness?: number;
 	zoomClassicMode?: boolean;
 	cursorMotionBlur?: number;
@@ -301,7 +297,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			showShadow,
 			shadowIntensity = 0,
 			backgroundBlur = 0,
-			zoomMotionBlur = 0,
 			connectZooms = true,
 			zoomInDurationMs = DEFAULT_ZOOM_IN_DURATION_MS,
 			zoomInOverlapMs = DEFAULT_ZOOM_IN_OVERLAP_MS,
@@ -332,6 +327,9 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			cursorStyle = "tahoe",
 			cursorSize = DEFAULT_CURSOR_SIZE,
 			cursorSmoothing = DEFAULT_CURSOR_SMOOTHING,
+			cursorSpringStiffnessMultiplier = 1,
+			cursorSpringDampingMultiplier = 1,
+			cursorSpringMassMultiplier = 1,
 			zoomSmoothness = 0.5,
 			zoomClassicMode = false,
 			cursorMotionBlur = DEFAULT_CURSOR_MOTION_BLUR,
@@ -346,8 +344,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const containerRef = useRef<HTMLDivElement | null>(null);
 		const appRef = useRef<Application | null>(null);
 		const videoSpriteRef = useRef<Sprite | null>(null);
+		const videoEffectsContainerRef = useRef<Container | null>(null);
 		const videoContainerRef = useRef<Container | null>(null);
 		const cursorContainerRef = useRef<Container | null>(null);
+		const zoomBlurFilterRef = useRef<ZoomBlurFilter | null>(null);
+		const motionBlurFilterRef = useRef<MotionBlurFilter | null>(null);
 		const cameraContainerRef = useRef<Container | null>(null);
 		const timeUpdateAnimationRef = useRef<number | null>(null);
 		const [pixiReady, setPixiReady] = useState(false);
@@ -362,8 +363,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const zoomRegionsRef = useRef<ZoomRegion[]>([]);
 		const selectedZoomIdRef = useRef<string | null>(null);
 		const animationStateRef = useRef<PlaybackAnimationState>(createPlaybackAnimationState());
-		const blurFilterRef = useRef<BlurFilter | null>(null);
-		const motionBlurFilterRef = useRef<MotionBlurFilter | null>(null);
 		const isDraggingFocusRef = useRef(false);
 		const stageSizeRef = useRef({ width: 0, height: 0 });
 		const videoSizeRef = useRef({ width: 0, height: 0 });
@@ -397,8 +396,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const trimRegionsRef = useRef<TrimRegion[]>([]);
 		const speedRegionsRef = useRef<SpeedRegion[]>([]);
 		const lastWebcamSyncTimeRef = useRef<number | null>(null);
+		const lastBackgroundSyncTimeRef = useRef<number | null>(null);
 		const bgVideoRef = useRef<HTMLVideoElement | null>(null);
-		const zoomMotionBlurRef = useRef(zoomMotionBlur);
 		const connectZoomsRef = useRef(connectZooms);
 		const zoomInDurationMsRef = useRef(zoomInDurationMs);
 		const zoomInOverlapMsRef = useRef(zoomInOverlapMs);
@@ -416,6 +415,9 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const cursorSizeRef = useRef(cursorSize);
 		const cursorStyleRef = useRef(cursorStyle);
 		const cursorSmoothingRef = useRef(cursorSmoothing);
+		const cursorSpringStiffnessMultiplierRef = useRef(cursorSpringStiffnessMultiplier);
+		const cursorSpringDampingMultiplierRef = useRef(cursorSpringDampingMultiplier);
+		const cursorSpringMassMultiplierRef = useRef(cursorSpringMassMultiplier);
 		const cursorMotionBlurRef = useRef(cursorMotionBlur);
 		const cursorClickBounceRef = useRef(cursorClickBounce);
 		const cursorClickBounceDurationRef = useRef(cursorClickBounceDuration);
@@ -597,6 +599,28 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			[],
 		);
 
+		const syncPreviewMotionBlurQuality = useCallback(() => {
+			const app = appRef.current;
+			const videoEffectsContainer = videoEffectsContainerRef.current;
+			const zoomBlurFilter = zoomBlurFilterRef.current;
+			const motionBlurFilter = motionBlurFilterRef.current;
+
+			if (!app || !videoEffectsContainer || !zoomBlurFilter || !motionBlurFilter) {
+				return;
+			}
+
+			const filterResolution = Math.max(
+				1,
+				app.renderer.resolution || window.devicePixelRatio || 1,
+			);
+			const stageWidth = Math.max(1, stageSizeRef.current.width || app.screen.width);
+			const stageHeight = Math.max(1, stageSizeRef.current.height || app.screen.height);
+
+			zoomBlurFilter.resolution = filterResolution;
+			motionBlurFilter.resolution = filterResolution;
+			videoEffectsContainer.filterArea = new Rectangle(0, 0, stageWidth, stageHeight);
+		}, []);
+
 		const layoutVideoContent = useCallback(() => {
 			const container = containerRef.current;
 			const app = appRef.current;
@@ -654,6 +678,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 			if (result) {
 				stageSizeRef.current = result.stageSize;
+				syncPreviewMotionBlurQuality();
 				videoSizeRef.current = result.videoSize;
 				baseScaleRef.current = result.baseScale;
 				baseOffsetRef.current = result.baseOffset;
@@ -737,6 +762,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			showShadow,
 			shadowIntensity,
 			applyWebcamBubbleLayout,
+			syncPreviewMotionBlurQuality,
 		]);
 
 		useEffect(() => {
@@ -1005,13 +1031,58 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			}
 		}, [isPlaying]);
 
-		// Sync background video wallpaper with timeline scrubbing
+		// Keep video wallpapers locked to the same source timestamp as the main clip.
 		useEffect(() => {
 			const bgVideo = bgVideoRef.current;
 			if (!bgVideo) return;
-			if (!isPlaying && bgVideo.duration && Number.isFinite(bgVideo.duration)) {
-				bgVideo.currentTime = currentTime % bgVideo.duration;
+
+			const clipTimelineTime = currentTime;
+			const videoDuration =
+				Number.isFinite(bgVideo.duration) && bgVideo.duration > 0 ? bgVideo.duration : null;
+			const targetTime = videoDuration
+				? clipTimelineTime % videoDuration
+				: clampMediaTimeToDuration(clipTimelineTime, videoDuration);
+
+			const activeSpeedRegion = speedRegionsRef.current.find(
+				(region) =>
+					currentTime * 1000 >= region.startMs && currentTime * 1000 < region.endMs,
+			);
+			const targetPlaybackRate = activeSpeedRegion ? activeSpeedRegion.speed : 1;
+			const syncedPlaybackRate = getMediaSyncPlaybackRate({
+				basePlaybackRate: targetPlaybackRate,
+				currentTime: bgVideo.currentTime,
+				targetTime,
+				toleranceSeconds: 0.02,
+				correctionWindowSeconds: 1.5,
+				maxAdjustment: 0.12,
+			});
+			if (Math.abs(bgVideo.playbackRate - syncedPlaybackRate) > 0.001) {
+				bgVideo.playbackRate = syncedPlaybackRate;
 			}
+
+			const previousTimelineTime = lastBackgroundSyncTimeRef.current;
+			const timelineJumped =
+				previousTimelineTime === null ||
+				Math.abs(clipTimelineTime - previousTimelineTime) > 0.25;
+			const driftThreshold = isPlaying ? 0.35 : 0.01;
+			if (timelineJumped || Math.abs(bgVideo.currentTime - targetTime) > driftThreshold) {
+				try {
+					bgVideo.currentTime = targetTime;
+				} catch {
+					// no-op
+				}
+			}
+
+			if (isPlaying) {
+				const playPromise = bgVideo.play();
+				if (playPromise) {
+					playPromise.catch(() => undefined);
+				}
+			} else {
+				bgVideo.pause();
+			}
+
+			lastBackgroundSyncTimeRef.current = clipTimelineTime;
 		}, [currentTime, isPlaying]);
 
 		useEffect(() => {
@@ -1023,8 +1094,23 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		}, [speedRegions]);
 
 		useEffect(() => {
-			zoomMotionBlurRef.current = zoomMotionBlur;
-		}, [zoomMotionBlur]);
+			const videoEffectsContainer = videoEffectsContainerRef.current;
+			const zoomBlurFilter = zoomBlurFilterRef.current;
+			const motionBlurFilter = motionBlurFilterRef.current;
+
+			if (!videoEffectsContainer || !zoomBlurFilter || !motionBlurFilter) {
+				return;
+			}
+
+			videoEffectsContainer.filters = null;
+			motionBlurFilter.velocity = { x: 0, y: 0 };
+			motionBlurFilter.kernelSize = 5;
+			motionBlurFilter.offset = 0;
+			zoomBlurFilter.strength = 0;
+			zoomBlurFilter.innerRadius = 0;
+			zoomBlurFilter.radius = -1;
+			motionBlurStateRef.current = createMotionBlurState();
+		}, [pixiReady]);
 
 		useEffect(() => {
 			connectZoomsRef.current = connectZooms;
@@ -1093,6 +1179,18 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		}, [cursorSmoothing]);
 
 		useEffect(() => {
+			cursorSpringStiffnessMultiplierRef.current = cursorSpringStiffnessMultiplier;
+		}, [cursorSpringStiffnessMultiplier]);
+
+		useEffect(() => {
+			cursorSpringDampingMultiplierRef.current = cursorSpringDampingMultiplier;
+		}, [cursorSpringDampingMultiplier]);
+
+		useEffect(() => {
+			cursorSpringMassMultiplierRef.current = cursorSpringMassMultiplier;
+		}, [cursorSpringMassMultiplier]);
+
+		useEffect(() => {
 			zoomSmoothnessRef.current = zoomSmoothness;
 		}, [zoomSmoothness]);
 
@@ -1150,10 +1248,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			cursorOverlayRef.current?.reset();
 			motionBlurStateRef.current = createMotionBlurState();
 
-			if (blurFilterRef.current) {
-				blurFilterRef.current.blur = 0;
-			}
-
 			requestAnimationFrame(() => {
 				const container = cameraContainerRef.current;
 				const videoStage = videoContainerRef.current;
@@ -1174,7 +1268,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 				applyZoomTransform({
 					cameraContainer: container,
-					blurFilter: blurFilterRef.current,
+					zoomBlurFilter: zoomBlurFilterRef.current,
+					motionBlurFilter: motionBlurFilterRef.current,
 					stageSize: stageSizeRef.current,
 					baseMask: baseMaskRef.current,
 					zoomScale: 1,
@@ -1182,7 +1277,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					focusY: DEFAULT_FOCUS.cy,
 					motionIntensity: 0,
 					isPlaying: false,
-					motionBlurAmount: zoomMotionBlurRef.current,
+					motionBlurAmount: 0,
+					motionBlurState: motionBlurStateRef.current,
 				});
 
 				requestAnimationFrame(() => {
@@ -1232,10 +1328,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				return;
 			}
 
-			const targetTime = clampMediaTimeToDuration(
+			const targetTime = getWebcamMediaTargetTimeSeconds({
 				currentTime,
-				Number.isFinite(webcamVideo.duration) ? webcamVideo.duration : null,
-			);
+				webcamDuration: Number.isFinite(webcamVideo.duration) ? webcamVideo.duration : null,
+				timeOffsetMs: webcam.timeOffsetMs,
+			});
 
 			const activeSpeedRegion = speedRegionsRef.current.find(
 				(region) => targetTime * 1000 >= region.startMs && targetTime * 1000 < region.endMs,
@@ -1272,6 +1369,10 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		useEffect(() => {
 			lastWebcamSyncTimeRef.current = null;
 		}, [webcamVideoPath]);
+
+		useEffect(() => {
+			lastBackgroundSyncTimeRef.current = null;
+		}, [wallpaper]);
 
 		useEffect(() => {
 			const overlayEl = overlayRef.current;
@@ -1336,10 +1437,19 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				cameraContainerRef.current = cameraContainer;
 				app.stage.addChild(cameraContainer);
 
+				// Match the export scene graph so zoom motion blur is applied to the
+				// same layer in preview and export.
+				const videoEffectsContainer = new Container();
+				videoEffectsContainerRef.current = videoEffectsContainer;
+				zoomBlurFilterRef.current = new ZoomBlurFilter({ strength: 0 });
+				motionBlurFilterRef.current = new MotionBlurFilter([0, 0], 5, 0);
+				cameraContainer.addChild(videoEffectsContainer);
+				syncPreviewMotionBlurQuality();
+
 				// Video container - holds the masked video sprite
 				const videoContainer = new Container();
 				videoContainerRef.current = videoContainer;
-				cameraContainer.addChild(videoContainer);
+				videoEffectsContainer.addChild(videoContainer);
 
 				// Device frame overlay container — sits above video but below cursor
 				const frameContainer = new Container();
@@ -1357,6 +1467,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 						dotRadius: DEFAULT_CURSOR_CONFIG.dotRadius * cursorSizeRef.current,
 						style: cursorStyleRef.current,
 						smoothingFactor: cursorSmoothingRef.current,
+						springTuning: {
+							stiffnessMultiplier: cursorSpringStiffnessMultiplierRef.current,
+							dampingMultiplier: cursorSpringDampingMultiplierRef.current,
+							massMultiplier: cursorSpringMassMultiplierRef.current,
+						},
 						motionBlur: cursorMotionBlurRef.current,
 						clickBounce: cursorClickBounceRef.current,
 						clickBounceDuration: cursorClickBounceDurationRef.current,
@@ -1385,6 +1500,10 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					cursorOverlayRef.current.destroy();
 					cursorOverlayRef.current = null;
 				}
+				zoomBlurFilterRef.current?.destroy();
+				motionBlurFilterRef.current?.destroy();
+				zoomBlurFilterRef.current = null;
+				motionBlurFilterRef.current = null;
 				if (app && app.renderer) {
 					app.destroy(true, {
 						children: true,
@@ -1394,6 +1513,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				}
 				appRef.current = null;
 				cameraContainerRef.current = null;
+				videoEffectsContainerRef.current = null;
 				videoContainerRef.current = null;
 				frameContainerRef.current = null;
 				frameSpriteRef.current = null;
@@ -1425,10 +1545,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 			const video = videoRef.current;
 			const app = appRef.current;
+			const videoEffectsContainer = videoEffectsContainerRef.current;
 			const videoContainer = videoContainerRef.current;
 			const cursorContainer = cursorContainerRef.current;
 
-			if (!video || !app || !videoContainer || !cursorContainer) return;
+			if (!video || !app || !videoEffectsContainer || !videoContainer || !cursorContainer)
+				return;
 			if (video.videoWidth === 0 || video.videoHeight === 0) return;
 
 			const source = VideoSource.from(video);
@@ -1454,23 +1576,10 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 			animationStateRef.current = createPlaybackAnimationState();
 
-			const blurFilter = new BlurFilter();
-			blurFilter.quality = 3;
-			blurFilter.resolution = app.renderer.resolution;
-			blurFilter.blur = 0;
-			const motionBlurFilter = new MotionBlurFilter([0, 0], 5, 0);
-			// Don't attach filters by default — the filter pipeline forces the video
-			// through an intermediate RenderTexture at renderer resolution, downsampling
-			// the native video and destroying detail. Filters are attached conditionally
-			// in the ticker only when zoom motion blur is actually active.
-			videoContainer.filters = null;
-			blurFilterRef.current = blurFilter;
-			motionBlurFilterRef.current = motionBlurFilter;
-
 			layoutVideoContent();
 			video.pause();
 
-			const { handlePlay, handlePause, handleSeeked, handleSeeking } =
+			const { handlePlay, handlePause, handleSeeked, handleSeeking, dispose } =
 				createVideoEventHandlers({
 					video,
 					isSeekingRef,
@@ -1496,10 +1605,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				video.removeEventListener("ended", handlePause);
 				video.removeEventListener("seeked", handleSeeked);
 				video.removeEventListener("seeking", handleSeeking);
-
-				if (timeUpdateAnimationRef.current) {
-					cancelAnimationFrame(timeUpdateAnimationRef.current);
-				}
+				dispose();
 
 				if (videoSprite) {
 					videoContainer.removeChild(videoSprite);
@@ -1511,15 +1617,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				}
 				videoContainer.mask = null;
 				maskGraphicsRef.current = null;
-				if (blurFilterRef.current) {
-					videoContainer.filters = [];
-					blurFilterRef.current.destroy();
-					blurFilterRef.current = null;
-				}
-				if (motionBlurFilterRef.current) {
-					motionBlurFilterRef.current.destroy();
-					motionBlurFilterRef.current = null;
-				}
+				videoEffectsContainer.filters = null;
 				videoTexture.destroy(false);
 
 				videoSpriteRef.current = null;
@@ -1531,8 +1629,9 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 			const app = appRef.current;
 			const videoSprite = videoSpriteRef.current;
+			const videoEffectsContainer = videoEffectsContainerRef.current;
 			const videoContainer = videoContainerRef.current;
-			if (!app || !videoSprite || !videoContainer) return;
+			if (!app || !videoSprite || !videoEffectsContainer || !videoContainer) return;
 
 			const applyTransform = (
 				transform: { scale: number; x: number; y: number },
@@ -1547,7 +1646,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 				const appliedTransform = applyZoomTransform({
 					cameraContainer,
-					blurFilter: blurFilterRef.current,
+					zoomBlurFilter: zoomBlurFilterRef.current,
 					motionBlurFilter: motionBlurFilterRef.current,
 					stageSize: stageSizeRef.current,
 					baseMask: baseMaskRef.current,
@@ -1558,7 +1657,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					motionIntensity,
 					motionVector,
 					isPlaying: isPlayingRef.current,
-					motionBlurAmount: zoomMotionBlurRef.current,
+					motionBlurAmount: 0,
 					transformOverride: transform,
 					motionBlurState: motionBlurStateRef.current,
 					frameTimeMs: performance.now(),
@@ -1575,6 +1674,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					currentTimeRef.current,
 					{
 						connectZooms: connectZoomsRef.current,
+						zoomInDurationMs: zoomInDurationMsRef.current,
+						zoomOutDurationMs: zoomOutDurationMsRef.current,
 					},
 				);
 
@@ -1743,20 +1844,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					motionIntensity,
 					motionVector,
 				);
-
-				// Conditionally attach motion blur filter only when the camera is
-				// actually moving. When filters are attached, PixiJS routes the video
-				// through an intermediate RenderTexture at renderer resolution, which
-				// downsamples the native video and degrades preview quality.
-				// Hysteresis prevents flickering when motionIntensity oscillates near threshold.
-				const filtersActive = Array.isArray(videoContainer.filters) && videoContainer.filters.length > 0;
-				const cameraIsMoving = filtersActive ? motionIntensity > 0.002 : motionIntensity > 0.008;
-				const needsFilters = zoomMotionBlurRef.current > 0 && isPlayingRef.current && cameraIsMoving;
-				if (needsFilters && !filtersActive && motionBlurFilterRef.current) {
-					videoContainer.filters = [motionBlurFilterRef.current];
-				} else if (!needsFilters && filtersActive) {
-					videoContainer.filters = null;
-				}
 
 				applyWebcamBubbleLayout(animationStateRef.current.appliedScale || 1);
 
@@ -1970,6 +2057,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 			overlay.setDotRadius(DEFAULT_CURSOR_CONFIG.dotRadius * cursorSize);
 			overlay.setSmoothingFactor(cursorSmoothing);
+			overlay.setSpringTuning({
+				stiffnessMultiplier: cursorSpringStiffnessMultiplier,
+				dampingMultiplier: cursorSpringDampingMultiplier,
+				massMultiplier: cursorSpringMassMultiplier,
+			});
 			overlay.setMotionBlur(cursorMotionBlur);
 			overlay.setClickBounce(cursorClickBounce);
 			overlay.setClickBounceDuration(cursorClickBounceDuration);
@@ -1998,6 +2090,9 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			cursorStyle,
 			cursorSize,
 			cursorSmoothing,
+			cursorSpringStiffnessMultiplier,
+			cursorSpringDampingMultiplier,
+			cursorSpringMassMultiplier,
 			cursorMotionBlur,
 			cursorClickBounce,
 			cursorClickBounceDuration,
@@ -2116,10 +2211,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					}
 
 					if (isVideoWallpaperSource(wallpaper)) {
-						let videoSrc = wallpaper;
-						if (wallpaper.startsWith("/") && !wallpaper.startsWith("//")) {
-							videoSrc = await getAssetPath(wallpaper.replace(/^\//, ""));
-						}
+						const videoSrc = await getRenderableVideoUrl(wallpaper);
 						if (mounted) {
 							setResolvedWallpaper(videoSrc);
 							setResolvedWallpaperKind("video");
@@ -2451,12 +2543,15 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 						})()}
 					</div>
 				)}
+				{/* Keep the source video off-screen instead of display:none so the
+					browser continues producing presented frames for Pixi and preview sync. */}
 				<video
 					ref={videoRef}
 					src={videoPath}
-					className="hidden"
+					className="pointer-events-none absolute left-0 top-0 h-px w-px opacity-0"
 					preload="metadata"
 					playsInline
+					aria-hidden="true"
 					onLoadedMetadata={handleLoadedMetadata}
 					onDurationChange={(e) => {
 						onDurationChange(e.currentTarget.duration);

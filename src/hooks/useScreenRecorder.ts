@@ -59,6 +59,7 @@ type DesktopCaptureMediaDevices = {
 type UseScreenRecorderReturn = {
 	recording: boolean;
 	paused: boolean;
+	finalizing: boolean;
 	countdownActive: boolean;
 	toggleRecording: () => void;
 	pauseRecording: () => void;
@@ -114,6 +115,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const [recording, setRecording] = useState(false);
 	const [paused, setPaused] = useState(false);
 	const [starting, setStarting] = useState(false);
+	const [finalizing, setFinalizing] = useState(false);
 	const [countdownActive, setCountdownActive] = useState(false);
 	const [isMacOS, setIsMacOS] = useState(false);
 	const [microphoneEnabled, setMicrophoneEnabled] = useState(false);
@@ -149,35 +151,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const accumulatedPausedDurationMs = useRef(0);
 	const pauseStartedAtMs = useRef<number | null>(null);
 	const pauseSegmentsRef = useRef<PauseSegment[]>([]);
-	const recordingFinalizationToastId = useRef<string | number | null>(null);
 	const micFallbackRecorder = useRef<MediaRecorder | null>(null);
 	const micFallbackChunks = useRef<Blob[]>([]);
 	const micFallbackStartDelayMs = useRef<number | null>(null);
+	const hideEditorOverlayCursorByDefault = useRef(false);
 
-	const showRecordingFinalizationToast = useCallback((message = "Preparing recording...") => {
-		recordingFinalizationToastId.current = toast.loading(message, {
-			id: recordingFinalizationToastId.current ?? undefined,
-			duration: Number.POSITIVE_INFINITY,
-		});
+	const notifyRecordingFinalizationFailure = useCallback(async (message: string) => {
+		setFinalizing(false);
+		toast.error(message, { duration: 10000 });
 	}, []);
-
-	const clearRecordingFinalizationToast = useCallback(() => {
-		const toastId = recordingFinalizationToastId.current;
-		if (toastId === null) {
-			return;
-		}
-
-		toast.dismiss(toastId);
-		recordingFinalizationToastId.current = null;
-	}, []);
-
-	const notifyRecordingFinalizationFailure = useCallback(
-		async (message: string) => {
-			clearRecordingFinalizationToast();
-			toast.error(message, { duration: 10000 });
-		},
-		[clearRecordingFinalizationToast],
-	);
 
 	const logNativeCaptureDiagnostics = useCallback(async (context: string) => {
 		if (typeof window.electronAPI?.getLastNativeCaptureDiagnostics !== "function") {
@@ -416,30 +398,36 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 	const finalizeRecordingSession = useCallback(
 		async (videoPath: string, webcamPath: string | null) => {
+			const shouldHideOverlayCursor = hideEditorOverlayCursorByDefault.current;
 			try {
 				if (webcamPath) {
 					await window.electronAPI.setCurrentRecordingSession({
 						videoPath,
 						webcamPath,
 						timeOffsetMs: webcamTimeOffsetMs.current,
+						hideOverlayCursorByDefault: shouldHideOverlayCursor,
 					});
 				} else {
-					await window.electronAPI.setCurrentVideoPath(videoPath);
+					await window.electronAPI.setCurrentVideoPath(videoPath, {
+						hideOverlayCursorByDefault: shouldHideOverlayCursor,
+					});
 				}
 			} catch (error) {
 				console.error("Failed to persist recording session metadata:", error);
 
 				try {
-					await window.electronAPI.setCurrentVideoPath(videoPath);
+					await window.electronAPI.setCurrentVideoPath(videoPath, {
+						hideOverlayCursorByDefault: shouldHideOverlayCursor,
+					});
 				} catch (fallbackError) {
 					console.error("Failed to persist fallback video path:", fallbackError);
 				}
 			}
 
-			clearRecordingFinalizationToast();
+			setFinalizing(false);
 			await window.electronAPI.switchToEditor();
 		},
-		[clearRecordingFinalizationToast],
+		[],
 	);
 
 	const stopMicFallbackRecorder = useCallback((): Promise<Blob | null> => {
@@ -690,9 +678,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		if (nativeScreenRecording.current) {
 			nativeScreenRecording.current = false;
 			setRecording(false);
+			setFinalizing(true);
 
 			void (async () => {
-				showRecordingFinalizationToast();
 				const fallbackStartDelayMs = micFallbackStartDelayMs.current;
 				const micFallbackBlobPromise = stopMicFallbackRecorder();
 				const webcamPath = await stopWebcamRecorder();
@@ -787,6 +775,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			cleanupCapturedMedia();
 			recorder.stop();
 			setRecording(false);
+			setFinalizing(true);
 			window.electronAPI?.setRecordingState(false);
 		}
 	});
@@ -926,6 +915,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 		try {
 			const platform = await window.electronAPI.getPlatform();
+			hideEditorOverlayCursorByDefault.current = false;
 			const existingSource = await window.electronAPI.getSelectedSource();
 			const selectedSource =
 				existingSource ?? (platform === "linux" ? LINUX_PORTAL_SOURCE : null);
@@ -1013,6 +1003,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				);
 				if (!nativeResult.success) {
 					if (useNativeWindowsCapture) {
+						hideEditorOverlayCursorByDefault.current = true;
 						console.warn(
 							"Native Windows capture failed, falling back to browser capture:",
 							nativeResult.error ?? nativeResult.message,
@@ -1112,6 +1103,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				}
 			}
 
+			hideEditorOverlayCursorByDefault.current = true;
+
 			const wantsAudioCapture = microphoneEnabled || systemAudioEnabled;
 			const browserCaptureSource = await resolveBrowserCaptureSource(selectedSource);
 
@@ -1133,6 +1126,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			let videoTrack: MediaStreamTrack | undefined;
 			let systemAudioIncluded = false;
 			const mediaDevices = navigator.mediaDevices as DesktopCaptureMediaDevices;
+			const useLinuxPortal = selectedSource.id === "screen:linux-portal";
 			const browserScreenVideoConstraints = {
 				mandatory: {
 					chromeMediaSource: CHROME_MEDIA_SOURCE,
@@ -1148,7 +1142,6 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 			if (wantsAudioCapture) {
 				let screenMediaStream: MediaStream;
-				const useLinuxPortal = selectedSource.id === "screen:linux-portal";
 				const acquireLinuxPortalStream = (withAudio: boolean) =>
 					mediaDevices.getDisplayMedia({
 						audio: withAudio,
@@ -1267,20 +1260,25 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					stream.current.addTrack(micAudioTrack);
 				}
 			} else {
-				const mediaStream = await mediaDevices.getDisplayMedia({
-					audio: false,
-					video: {
-						displaySurface: selectedSource.id?.startsWith("window:")
-							? "window"
-							: "monitor",
-						width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
-						height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
-						frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
-						cursor: "never",
-					},
-					selfBrowserSurface: "exclude",
-					surfaceSwitching: "exclude",
-				});
+				const mediaStream = useLinuxPortal
+					? await mediaDevices.getDisplayMedia({
+							audio: false,
+							video: {
+								displaySurface: selectedSource.id?.startsWith("window:")
+									? "window"
+									: "monitor",
+								width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
+								height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
+								frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
+								cursor: "never",
+							},
+							selfBrowserSurface: "exclude",
+							surfaceSwitching: "exclude",
+						})
+					: await mediaDevices.getUserMedia({
+							audio: false,
+							video: browserScreenVideoConstraints,
+						});
 
 				stream.current = mediaStream;
 				videoTrack = mediaStream.getVideoTracks()[0];
@@ -1341,9 +1339,10 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			};
 			recorder.onstop = async () => {
 				cleanupCapturedMedia();
-				if (chunks.current.length === 0) return;
-
-				showRecordingFinalizationToast();
+				if (chunks.current.length === 0) {
+					setFinalizing(false);
+					return;
+				}
 
 				const duration = getRecordingDurationMs(Date.now());
 				const recordedChunks = chunks.current;
@@ -1436,8 +1435,14 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (webcamRecorder.current?.state === "recording") {
 					webcamRecorder.current.pause();
 				}
-				markRecordingPaused(Date.now());
+				const boundaryMs = Date.now();
+				markRecordingPaused(boundaryMs);
 				setPaused(true);
+				try {
+					await window.electronAPI.pauseCursorCapture();
+				} catch (error) {
+					console.warn("Failed to pause cursor capture:", error);
+				}
 			})();
 			return;
 		}
@@ -1446,8 +1451,16 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			if (webcamRecorder.current?.state === "recording") {
 				webcamRecorder.current.pause();
 			}
-			markRecordingPaused(Date.now());
-			setPaused(true);
+			void (async () => {
+				const boundaryMs = Date.now();
+				markRecordingPaused(boundaryMs);
+				setPaused(true);
+				try {
+					await window.electronAPI.pauseCursorCapture();
+				} catch (error) {
+					console.warn("Failed to pause cursor capture:", error);
+				}
+			})();
 		}
 	}, [markRecordingPaused, paused, recording]);
 
@@ -1467,8 +1480,14 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (webcamRecorder.current?.state === "paused") {
 					webcamRecorder.current.resume();
 				}
-				markRecordingResumed(Date.now());
+				const boundaryMs = Date.now();
+				markRecordingResumed(boundaryMs);
 				setPaused(false);
+				try {
+					await window.electronAPI.resumeCursorCapture();
+				} catch (error) {
+					console.warn("Failed to resume cursor capture:", error);
+				}
 			})();
 			return;
 		}
@@ -1477,8 +1496,16 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			if (webcamRecorder.current?.state === "paused") {
 				webcamRecorder.current.resume();
 			}
-			markRecordingResumed(Date.now());
-			setPaused(false);
+			void (async () => {
+				const boundaryMs = Date.now();
+				markRecordingResumed(boundaryMs);
+				setPaused(false);
+				try {
+					await window.electronAPI.resumeCursorCapture();
+				} catch (error) {
+					console.warn("Failed to resume cursor capture:", error);
+				}
+			})();
 		}
 	}, [markRecordingResumed, paused, recording]);
 
@@ -1530,7 +1557,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	}, [cleanupCapturedMedia, markRecordingResumed, recording]);
 
 	const toggleRecording = async () => {
-		if (starting || countdownActive) {
+		if (starting || countdownActive || finalizing) {
 			return;
 		}
 
@@ -1558,6 +1585,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	return {
 		recording,
 		paused,
+		finalizing,
 		countdownActive,
 		toggleRecording,
 		pauseRecording,

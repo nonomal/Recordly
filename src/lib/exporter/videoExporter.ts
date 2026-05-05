@@ -48,6 +48,9 @@ interface VideoExporterConfig extends ExportConfig {
 	shadowIntensity: number;
 	backgroundBlur: number;
 	zoomMotionBlur?: number;
+	zoomTemporalMotionBlur?: number;
+	zoomMotionBlurSampleCount?: number | null;
+	zoomMotionBlurShutterFraction?: number | null;
 	connectZooms?: boolean;
 	zoomInDurationMs?: number;
 	zoomInOverlapMs?: number;
@@ -71,6 +74,9 @@ interface VideoExporterConfig extends ExportConfig {
 	cursorStyle?: CursorStyle;
 	cursorSize?: number;
 	cursorSmoothing?: number;
+	cursorSpringStiffnessMultiplier?: number;
+	cursorSpringDampingMultiplier?: number;
+	cursorSpringMassMultiplier?: number;
 	cursorMotionBlur?: number;
 	cursorClickBounce?: number;
 	cursorClickBounceDuration?: number;
@@ -192,6 +198,9 @@ export class VideoExporter {
 				shadowIntensity: this.config.shadowIntensity,
 				backgroundBlur: this.config.backgroundBlur,
 				zoomMotionBlur: this.config.zoomMotionBlur,
+				zoomTemporalMotionBlur: this.config.zoomTemporalMotionBlur,
+				zoomMotionBlurSampleCount: this.config.zoomMotionBlurSampleCount,
+				zoomMotionBlurShutterFraction: this.config.zoomMotionBlurShutterFraction,
 				connectZooms: this.config.connectZooms,
 				zoomInDurationMs: this.config.zoomInDurationMs,
 				zoomInOverlapMs: this.config.zoomInOverlapMs,
@@ -219,6 +228,9 @@ export class VideoExporter {
 				cursorStyle: this.config.cursorStyle,
 				cursorSize: this.config.cursorSize,
 				cursorSmoothing: this.config.cursorSmoothing,
+				cursorSpringStiffnessMultiplier: this.config.cursorSpringStiffnessMultiplier,
+				cursorSpringDampingMultiplier: this.config.cursorSpringDampingMultiplier,
+				cursorSpringMassMultiplier: this.config.cursorSpringMassMultiplier,
 				cursorMotionBlur: this.config.cursorMotionBlur,
 				cursorClickBounce: this.config.cursorClickBounce,
 				cursorClickBounceDuration: this.config.cursorClickBounceDuration,
@@ -274,6 +286,8 @@ export class VideoExporter {
 						videoFrame,
 						sourceTimestampUs,
 						cursorTimestampUs,
+						frameDuration,
+						timestamp,
 					);
 					videoFrame.close();
 
@@ -380,9 +394,9 @@ export class VideoExporter {
 				}
 			}
 
-			// Finalize muxer and get output blob
+			// Finalize muxer and get output (temp path for streaming, blob for legacy)
 			this.reportFinalizingProgress(totalFrames, 99);
-			const blob = await this.measureFinalizationStage("muxerFinalizeMs", async () =>
+			const muxerResult = await this.measureFinalizationStage("muxerFinalizeMs", async () =>
 				this.awaitWithFinalizationTimeout(
 					this.muxer!.finalize(),
 					"muxer finalization",
@@ -395,7 +409,7 @@ export class VideoExporter {
 					"[VideoExporter] Browser AAC encoding is unavailable; falling back to FFmpeg audio muxing.",
 				);
 				const result = await this.finalizeExportWithFfmpegAudio(
-					blob,
+					muxerResult,
 					audioPlan,
 					totalFrames,
 				);
@@ -407,7 +421,14 @@ export class VideoExporter {
 			}
 
 			this.finalizationTimeMs = this.getNowMs() - finalizationStartedAt;
-			return { success: true, blob, metrics: this.buildExportMetrics() };
+			if (muxerResult.mode === "stream") {
+				return {
+					success: true,
+					tempFilePath: muxerResult.tempFilePath,
+					metrics: this.buildExportMetrics(),
+				};
+			}
+			return { success: true, blob: muxerResult.blob, metrics: this.buildExportMetrics() };
 		} catch (error) {
 			if (this.cancelled && !this.encoderError) {
 				return {
@@ -843,7 +864,7 @@ export class VideoExporter {
 			this.finalizationStageMs.ffmpegAudioMuxBreakdown = result.metrics;
 		}
 
-		if (!result.success || !result.data) {
+		if (!result.success || !result.tempPath) {
 			return {
 				success: false,
 				error: result.error || "Failed to finalize native video export",
@@ -851,22 +872,19 @@ export class VideoExporter {
 			};
 		}
 
-		const blobData = new Uint8Array(result.data.byteLength);
-		blobData.set(result.data);
-
 		return {
 			success: true,
-			blob: new Blob([blobData.buffer], { type: "video/mp4" }),
+			tempFilePath: result.tempPath,
 			metrics: this.buildExportMetrics(),
 		};
 	}
 
 	private async finalizeExportWithFfmpegAudio(
-		videoBlob: Blob,
+		videoSource: import("./muxer").MuxerFinalizeResult,
 		audioPlan: NativeAudioPlan,
 		totalFrames: number,
 	): Promise<ExportResult> {
-		if (typeof window === "undefined" || !window.electronAPI?.muxExportedVideoAudio) {
+		if (typeof window === "undefined") {
 			return {
 				success: false,
 				error: "FFmpeg audio fallback is unavailable in this environment.",
@@ -903,35 +921,72 @@ export class VideoExporter {
 			editedAudioMimeType = audioBlob.type || null;
 		}
 
-		const videoBuffer = await videoBlob.arrayBuffer();
+		const muxOptions = {
+			audioMode: audioPlan.audioMode,
+			audioSourcePath:
+				audioPlan.audioMode === "copy-source" ||
+				audioPlan.audioMode === "trim-source" ||
+				(audioPlan.audioMode === "edited-track" &&
+					audioPlan.strategy === "filtergraph-fast-path")
+					? audioPlan.audioSourcePath
+					: null,
+			trimSegments:
+				audioPlan.audioMode === "trim-source" ? audioPlan.trimSegments : undefined,
+			editedTrackStrategy:
+				audioPlan.audioMode === "edited-track" ? audioPlan.strategy : undefined,
+			editedTrackSegments:
+				audioPlan.audioMode === "edited-track" &&
+				audioPlan.strategy === "filtergraph-fast-path"
+					? audioPlan.editedTrackSegments
+					: undefined,
+			audioSourceSampleRate:
+				audioPlan.audioMode === "edited-track" &&
+				audioPlan.strategy === "filtergraph-fast-path"
+					? audioPlan.audioSourceSampleRate
+					: undefined,
+			editedAudioData: editedAudioBuffer,
+			editedAudioMimeType,
+		};
+
+		if (videoSource.mode === "stream") {
+			if (!window.electronAPI?.muxExportedVideoAudioFromPath) {
+				return {
+					success: false,
+					error: "FFmpeg audio fallback via temp path is unavailable in this environment.",
+				};
+			}
+			const result = await this.measureFinalizationStage("ffmpegAudioMuxMs", async () =>
+				this.awaitWithFinalizationTimeout(
+					window.electronAPI.muxExportedVideoAudioFromPath(
+						videoSource.tempFilePath,
+						muxOptions,
+					),
+					"ffmpeg audio muxing",
+					"audio",
+				),
+			);
+			if (result.metrics) {
+				this.finalizationStageMs.ffmpegAudioMuxBreakdown = result.metrics;
+			}
+			if (!result.success || !result.tempPath) {
+				return {
+					success: false,
+					error: result.error || "Failed to mux exported audio with FFmpeg",
+				};
+			}
+			return { success: true, tempFilePath: result.tempPath };
+		}
+
+		if (!window.electronAPI?.muxExportedVideoAudio) {
+			return {
+				success: false,
+				error: "FFmpeg audio fallback is unavailable in this environment.",
+			};
+		}
+		const videoBuffer = await videoSource.blob.arrayBuffer();
 		const result = await this.measureFinalizationStage("ffmpegAudioMuxMs", async () =>
 			this.awaitWithFinalizationTimeout(
-				window.electronAPI.muxExportedVideoAudio(videoBuffer, {
-					audioMode: audioPlan.audioMode,
-					audioSourcePath:
-						audioPlan.audioMode === "copy-source" ||
-						audioPlan.audioMode === "trim-source" ||
-						(audioPlan.audioMode === "edited-track" &&
-							audioPlan.strategy === "filtergraph-fast-path")
-							? audioPlan.audioSourcePath
-							: null,
-					trimSegments:
-						audioPlan.audioMode === "trim-source" ? audioPlan.trimSegments : undefined,
-					editedTrackStrategy:
-						audioPlan.audioMode === "edited-track" ? audioPlan.strategy : undefined,
-					editedTrackSegments:
-						audioPlan.audioMode === "edited-track" &&
-						audioPlan.strategy === "filtergraph-fast-path"
-							? audioPlan.editedTrackSegments
-							: undefined,
-					audioSourceSampleRate:
-						audioPlan.audioMode === "edited-track" &&
-						audioPlan.strategy === "filtergraph-fast-path"
-							? audioPlan.audioSourceSampleRate
-							: undefined,
-					editedAudioData: editedAudioBuffer,
-					editedAudioMimeType,
-				}),
+				window.electronAPI.muxExportedVideoAudio(videoBuffer, muxOptions),
 				"ffmpeg audio muxing",
 				"audio",
 			),
@@ -940,7 +995,7 @@ export class VideoExporter {
 			this.finalizationStageMs.ffmpegAudioMuxBreakdown = result.metrics;
 		}
 
-		if (!result.success || !result.data) {
+		if (!result.success || !result.tempPath) {
 			return {
 				success: false,
 				error: result.error || "Failed to mux exported audio with FFmpeg",
@@ -948,11 +1003,11 @@ export class VideoExporter {
 			};
 		}
 
-		const blobData = new Uint8Array(result.data.byteLength);
-		blobData.set(result.data);
+		// Returning a temp path (instead of buffering the muxed bytes back into
+		// the renderer) is what keeps >2 GiB exports off Node's fs.readFile cap.
 		return {
 			success: true,
-			blob: new Blob([blobData.buffer], { type: "video/mp4" }),
+			tempFilePath: result.tempPath,
 			metrics: this.buildExportMetrics(),
 		};
 	}

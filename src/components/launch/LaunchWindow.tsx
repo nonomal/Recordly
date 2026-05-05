@@ -1,7 +1,5 @@
 import {
 	AppWindow,
-	ArrowCircleUp as ArrowUpCircle,
-	CheckCircle as CheckCircle2,
 	CaretUp as ChevronUp,
 	Eye,
 	EyeSlash as EyeOff,
@@ -42,6 +40,10 @@ import ProjectBrowserDialog, {
 	type ProjectLibraryEntry,
 } from "../video-editor/ProjectBrowserDialog";
 import {
+	canShowFloatingWebcamPreview,
+	canToggleFloatingWebcamPreview,
+} from "./floatingWebcamPreview";
+import {
 	mergeHudInteractiveBounds,
 	shouldRestoreHudMousePassthroughAfterDrag,
 } from "./hudMousePassthrough";
@@ -59,17 +61,21 @@ interface DesktopSource {
 }
 
 const LOCALE_LABELS: Record<string, string> = {
-	en: "EN",
-	es: "ES",
-	nl: "NL",
-	"zh-CN": "中文",
+	en: "English",
+	es: "Español",
+	fr: "Français",
+	nl: "Nederlands",
 	ko: "한국어",
+	"pt-BR": "Português",
+	"zh-CN": "簡體中文",
+	"zh-TW": "繁體中文",
 };
 
 const COUNTDOWN_OPTIONS = [0, 3, 5, 10];
 const WEBCAM_PREVIEW_DRAG_THRESHOLD = 6;
 const DEFAULT_WEBCAM_PREVIEW_OFFSET = { x: 0, y: 0 };
 const DEFAULT_RECORDING_HUD_OFFSET = { x: 0, y: 0 };
+const SHOW_DEV_UPDATE_PREVIEW = import.meta.env.DEV;
 
 function IconButton({
 	onClick,
@@ -161,6 +167,7 @@ export function LaunchWindow() {
 	const {
 		recording,
 		paused,
+		finalizing,
 		countdownActive,
 		toggleRecording,
 		pauseRecording,
@@ -199,26 +206,11 @@ export function LaunchWindow() {
 	const [showFloatingWebcamPreview, setShowFloatingWebcamPreview] = useState(true);
 	const [webcamPreviewOffset, setWebcamPreviewOffset] = useState(DEFAULT_WEBCAM_PREVIEW_OFFSET);
 	const [recordingHudOffset, setRecordingHudOffset] = useState(DEFAULT_RECORDING_HUD_OFFSET);
+	const [hudOverlayMousePassthroughSupported, setHudOverlayMousePassthroughSupported] = useState<
+		boolean | null
+	>(null);
 	const [platform, setPlatform] = useState<string | null>(null);
 	const [appVersion, setAppVersion] = useState<string | null>(null);
-	const [updateStatus, setUpdateStatus] = useState<{
-		status:
-			| "idle"
-			| "checking"
-			| "up-to-date"
-			| "available"
-			| "downloading"
-			| "ready"
-			| "error";
-		currentVersion: string;
-		availableVersion: string | null;
-		detail?: string;
-	}>({
-		status: "idle",
-		currentVersion: "",
-		availableVersion: null,
-	});
-	const [updateActionPending, setUpdateActionPending] = useState(false);
 	const dropdownRef = useRef<HTMLDivElement>(null);
 	const hudContentRef = useRef<HTMLDivElement>(null);
 	const hudBarRef = useRef<HTMLDivElement>(null);
@@ -264,9 +256,14 @@ export function LaunchWindow() {
 	const micDropdownOpen = activeDropdown === "mic";
 	const webcamDropdownOpen = activeDropdown === "webcam";
 	const showWebcamControls = webcamEnabled && !recording;
-	const showRecordingWebcamPreview = webcamEnabled && showFloatingWebcamPreview;
+	const showRecordingWebcamPreview =
+		webcamEnabled &&
+		canShowFloatingWebcamPreview(
+			showFloatingWebcamPreview,
+			hudOverlayMousePassthroughSupported,
+		);
 	const shouldStreamWebcamPreview =
-		webcamEnabled && (showFloatingWebcamPreview || (showWebcamControls && webcamDropdownOpen));
+		webcamEnabled && (showRecordingWebcamPreview || (showWebcamControls && webcamDropdownOpen));
 	const { devices, selectedDeviceId, setSelectedDeviceId } = useMicrophoneDevices(
 		microphoneEnabled || micDropdownOpen,
 		microphoneDeviceId,
@@ -681,33 +678,26 @@ export function LaunchWindow() {
 	}, []);
 
 	useEffect(() => {
-		void preparePermissions({ startup: true });
-	}, [preparePermissions]);
-
-	useEffect(() => {
-		let mounted = true;
-
-		const refreshUpdateStatus = async () => {
+		let cancelled = false;
+		const loadHudOverlayMousePassthroughSupport = async () => {
 			try {
-				const summary = await window.electronAPI.getUpdateStatusSummary();
-				if (mounted) {
-					setUpdateStatus(summary);
+				const result = await window.electronAPI.getHudOverlayMousePassthroughSupported();
+				if (!cancelled && result.success) {
+					setHudOverlayMousePassthroughSupported(result.supported);
 				}
 			} catch (error) {
-				console.error("Failed to load update status summary:", error);
+				console.error("Failed to load HUD overlay mouse passthrough support:", error);
 			}
 		};
-
-		void refreshUpdateStatus();
-		const pollTimer = window.setInterval(() => {
-			void refreshUpdateStatus();
-		}, 2500);
-
+		void loadHudOverlayMousePassthroughSupport();
 		return () => {
-			mounted = false;
-			window.clearInterval(pollTimer);
+			cancelled = true;
 		};
 	}, []);
+
+	useEffect(() => {
+		void preparePermissions({ startup: true });
+	}, [preparePermissions]);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -979,74 +969,6 @@ export function LaunchWindow() {
 		toggleDropdown("webcam");
 	};
 
-	const updateButtonLabel =
-		updateStatus.status === "up-to-date"
-			? t("recording.update.updated")
-			: t("recording.update.update");
-	const updateButtonTitle = (() => {
-		switch (updateStatus.status) {
-			case "up-to-date":
-				return t("recording.update.upToDateTitle", "Recordly {{version}} is up to date.", {
-					version: updateStatus.currentVersion,
-				});
-			case "available":
-			case "ready":
-				return updateStatus.availableVersion
-					? t("recording.update.availableTitle", "Recordly {{version}} is available.", {
-							version: updateStatus.availableVersion,
-						})
-					: t("recording.update.availableGenericTitle");
-			case "downloading":
-				return updateStatus.detail ?? t("recording.update.downloadingTitle");
-			case "checking":
-				return t("recording.update.checkingTitle");
-			case "error":
-				return updateStatus.detail ?? t("recording.update.errorTitle");
-			default:
-				return t("recording.update.idleTitle");
-		}
-	})();
-	const updateButtonClassName = `${styles.updateBadge} ${updateStatus.status === "up-to-date" ? styles.updateBadgeQuiet : styles.updateBadgeHot} ${styles.electronNoDrag}`;
-	const updateButtonIcon = (() => {
-		switch (updateStatus.status) {
-			case "up-to-date":
-				return <CheckCircle2 size={14} />;
-			case "checking":
-			case "downloading":
-				return <RefreshCw size={14} className={styles.updateBadgeSpin} />;
-			default:
-				return <ArrowUpCircle size={14} />;
-		}
-	})();
-
-	const handleUpdateButtonClick = async () => {
-		if (updateActionPending || updateStatus.status === "downloading") {
-			return;
-		}
-
-		setUpdateActionPending(true);
-		try {
-			switch (updateStatus.status) {
-				case "available":
-					await window.electronAPI.downloadAvailableUpdate();
-					break;
-				case "ready":
-					await window.electronAPI.installDownloadedUpdate();
-					break;
-				default:
-					await window.electronAPI.checkForAppUpdates();
-					break;
-			}
-
-			const summary = await window.electronAPI.getUpdateStatusSummary();
-			setUpdateStatus(summary);
-		} catch (error) {
-			console.error("Failed to handle update button action:", error);
-		} finally {
-			setUpdateActionPending(false);
-		}
-	};
-
 	const recordingControls = (
 		<>
 			<div className="flex items-center gap-[5px]">
@@ -1207,6 +1129,18 @@ export function LaunchWindow() {
 			</IconButton>
 		</>
 	);
+
+	const finalizingControls = (
+		<div className={styles.finalizingState}>
+			<RefreshCw size={15} className={styles.finalizingSpin} />
+			<div className={styles.finalizingCopy}>
+				<span>{t("recording.preparing", "Preparing recording")}</span>
+				<small>{t("recording.preparingSubtitle", "Opening the editor in a moment")}</small>
+			</div>
+		</div>
+	);
+
+	const hudMode = finalizing ? "finalizing" : recording ? "recording" : "idle";
 
 	return (
 		<div
@@ -1403,25 +1337,29 @@ export function LaunchWindow() {
 											>
 												{t("recording.turnOffWebcam")}
 											</DropdownItem>
-											<DropdownItem
-												icon={
-													showFloatingWebcamPreview ? (
-														<EyeOff size={16} />
-													) : (
-														<Eye size={16} />
-													)
-												}
-												selected={showFloatingWebcamPreview}
-												onClick={() => {
-													setShowFloatingWebcamPreview(
-														(current) => !current,
-													);
-												}}
-											>
-												{showFloatingWebcamPreview
-													? t("recording.hideFloatingWebcamPreview")
-													: t("recording.showFloatingWebcamPreview")}
-											</DropdownItem>
+											{canToggleFloatingWebcamPreview(
+												hudOverlayMousePassthroughSupported,
+											) ? (
+												<DropdownItem
+													icon={
+														showFloatingWebcamPreview ? (
+															<EyeOff size={16} />
+														) : (
+															<Eye size={16} />
+														)
+													}
+													selected={showFloatingWebcamPreview}
+													onClick={() => {
+														setShowFloatingWebcamPreview(
+															(current) => !current,
+														);
+													}}
+												>
+													{showFloatingWebcamPreview
+														? t("recording.hideFloatingWebcamPreview")
+														: t("recording.showFloatingWebcamPreview")}
+												</DropdownItem>
+											) : null}
 										</>
 									)}
 									{!webcamEnabled && (
@@ -1538,6 +1476,24 @@ export function LaunchWindow() {
 									>
 										{t("recording.openProject")}
 									</DropdownItem>
+									{SHOW_DEV_UPDATE_PREVIEW ? (
+										<DropdownItem
+											icon={<RefreshCw size={16} />}
+											onClick={() => {
+												setActiveDropdown("none");
+												void window.electronAPI
+													.previewUpdateToast()
+													.catch((error) => {
+														console.warn(
+															"Failed to preview update toast:",
+															error,
+														);
+													});
+											}}
+										>
+											{t("recording.previewUpdateUi", "Preview Update UI")}
+										</DropdownItem>
+									) : null}
 									<div className={styles.ddLabel} style={{ marginTop: 4 }}>
 										{t("recording.language")}
 									</div>
@@ -1606,23 +1562,10 @@ export function LaunchWindow() {
 								<RxDragHandleDots2 size={14} className="text-[#6b6b78]" />
 							</div>
 
-							<button
-								type="button"
-								onClick={() => {
-									void handleUpdateButtonClick();
-								}}
-								className={updateButtonClassName}
-								title={updateButtonTitle}
-								disabled={updateActionPending}
-							>
-								{updateButtonIcon}
-								<span>{updateButtonLabel}</span>
-							</button>
-
 							<div className={styles.barStateViewport}>
 								<AnimatePresence initial={false} mode="wait">
 									<motion.div
-										key={recording ? "recording" : "idle"}
+										key={hudMode}
 										layout={!showRecordingWebcamPreview}
 										className={styles.barState}
 										initial={{
@@ -1645,7 +1588,11 @@ export function LaunchWindow() {
 										}}
 										transition={hudStateTransition}
 									>
-										{recording ? recordingControls : idleControls}
+										{finalizing
+											? finalizingControls
+											: recording
+												? recordingControls
+												: idleControls}
 									</motion.div>
 								</AnimatePresence>
 							</div>
